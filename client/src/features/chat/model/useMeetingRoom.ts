@@ -27,6 +27,8 @@ type UseMeetingRoomResult = {
     hasLocalMedia: boolean;
     isFullscreen: boolean;
     connectionHint: string;
+    speakingIds: Set<string>;
+    localSpeaking: boolean;
     enableMedia: () => Promise<void>;
     toggleMute: () => Promise<void>;
     toggleCam: () => Promise<void>;
@@ -36,27 +38,33 @@ type UseMeetingRoomResult = {
     toggleRemoteSound: () => void;
 };
 
-const ICE: RTCConfiguration = {
+const FALLBACK_ICE: RTCConfiguration = {
     iceServers: [
         { urls: "stun:stun.l.google.com:19302" },
-        { urls: "stun:stun.relay.metered.ca:80" },
-        {
-            urls: "turn:standard.relay.metered.ca:80",
-            username: "openrelayproject",
-            credential: "openrelayproject",
-        },
-        {
-            urls: "turn:standard.relay.metered.ca:443",
-            username: "openrelayproject",
-            credential: "openrelayproject",
-        },
-        {
-            urls: "turn:standard.relay.metered.ca:443?transport=tcp",
-            username: "openrelayproject",
-            credential: "openrelayproject",
-        },
+        { urls: "stun:stun1.l.google.com:19302" },
+        { urls: "stun:stun.cloudflare.com:3478" },
     ],
 };
+
+let iceConfigPromise: Promise<RTCConfiguration> | null = null;
+const analyserHolders = new WeakMap<
+    MediaStream,
+    { source: MediaStreamAudioSourceNode; analyser: AnalyserNode; trackId: string }
+>();
+
+async function loadIceConfig(): Promise<RTCConfiguration> {
+    if (!iceConfigPromise) {
+        iceConfigPromise = fetch("/api/ice")
+            .then(async (res) => {
+                if (!res.ok) return FALLBACK_ICE;
+                const data = (await res.json()) as { iceServers?: RTCIceServer[] };
+                if (!data.iceServers?.length) return FALLBACK_ICE;
+                return { iceServers: data.iceServers };
+            })
+            .catch(() => FALLBACK_ICE);
+    }
+    return iceConfigPromise;
+}
 
 function connectionLabel(state: string): string {
     switch (state) {
@@ -177,10 +185,85 @@ export function useMeetingRoom(
     const [isFullscreen, setIsFullscreen] = useState(false);
     const [remoteSoundOff, setRemoteSoundOff] = useState(false);
     const [connectionHint, setConnectionHint] = useState("Подключение…");
+    const [speakingIds, setSpeakingIds] = useState<Set<string>>(() => new Set());
+    const [localSpeaking, setLocalSpeaking] = useState(false);
+    const iceConfigRef = useRef<RTCConfiguration>(FALLBACK_ICE);
+    const analyseCtxRef = useRef<AudioContext | null>(null);
 
     useEffect(() => {
         localUserIdRef.current = localUserId;
     }, [localUserId]);
+
+    useEffect(() => {
+        void loadIceConfig().then((cfg) => {
+            iceConfigRef.current = cfg;
+        });
+    }, []);
+
+    useEffect(() => {
+        let stopped = false;
+        let raf = 0;
+
+        const tick = () => {
+            if (stopped) return;
+            const next = new Set<string>();
+            let localTalk = false;
+
+            const measure = (id: string, stream: MediaStream | null, isLocal: boolean) => {
+                if (!stream) return;
+                const audioTracks = stream.getAudioTracks().filter((t) => t.enabled && t.readyState === "live");
+                if (audioTracks.length === 0) return;
+                try {
+                    if (!analyseCtxRef.current) {
+                        analyseCtxRef.current = new AudioContext();
+                    }
+                    const ctx = analyseCtxRef.current;
+                    if (ctx.state === "suspended") void ctx.resume();
+                    const trackId = audioTracks[0].id;
+                    let holder = analyserHolders.get(stream);
+                    if (!holder || holder.trackId !== trackId) {
+                        const source = ctx.createMediaStreamSource(new MediaStream([audioTracks[0]]));
+                        const analyser = ctx.createAnalyser();
+                        analyser.fftSize = 256;
+                        analyser.smoothingTimeConstant = 0.5;
+                        source.connect(analyser);
+                        holder = { source, analyser, trackId };
+                        analyserHolders.set(stream, holder);
+                    }
+                    const data = new Uint8Array(holder.analyser.frequencyBinCount);
+                    holder.analyser.getByteFrequencyData(data);
+                    let sum = 0;
+                    for (let i = 0; i < data.length; i += 1) sum += data[i];
+                    const avg = sum / data.length;
+                    if (avg > 18) {
+                        next.add(id);
+                        if (isLocal) localTalk = true;
+                    }
+                } catch {
+                    // AudioContext / analyser unavailable
+                }
+            };
+
+            const localId = localUserIdRef.current || "local";
+            if (!isMutedRef.current) measure(localId, localStreamRef.current, true);
+            for (const [id, stream] of remoteStreamsRef.current) {
+                measure(id, stream, false);
+            }
+
+            setSpeakingIds((prev) => {
+                if (prev.size === next.size && [...prev].every((id) => next.has(id))) return prev;
+                return next;
+            });
+            setLocalSpeaking(localTalk);
+            raf = window.setTimeout(tick, 120);
+        };
+
+        raf = window.setTimeout(tick, 120);
+        return () => {
+            stopped = true;
+            window.clearTimeout(raf);
+        };
+    }, []);
 
     const publishTiles = useCallback(() => {
         const next: PeerTileType[] = [];
@@ -261,7 +344,12 @@ export function useMeetingRoom(
 
         for (const { pc } of peersRef.current.values()) {
             for (const track of stream.getTracks()) {
-                if (!pc.getSenders().some((s) => s.track?.kind === track.kind)) {
+                const sender =
+                    pc.getSenders().find((s) => s.track?.kind === track.kind) ??
+                    pc.getTransceivers().find((t) => t.receiver.track.kind === track.kind)?.sender;
+                if (sender) {
+                    void sender.replaceTrack(track);
+                } else {
                     pc.addTrack(track, stream);
                 }
             }
@@ -296,15 +384,19 @@ export function useMeetingRoom(
 
         const localId = localUserIdRef.current;
         const polite = localId > remoteId;
-        const pc = new RTCPeerConnection(ICE);
+        const pc = new RTCPeerConnection(iceConfigRef.current);
         const state: PeerStateType = { pc, makingOffer: false, ignoreOffer: false, polite };
         peersRef.current.set(remoteId, state);
 
+        const audioTx = pc.addTransceiver("audio", { direction: "sendrecv" });
+        const videoTx = pc.addTransceiver("video", { direction: "sendrecv" });
+
         const local = localStreamRef.current;
         if (local) {
-            for (const track of local.getTracks()) {
-                pc.addTrack(track, local);
-            }
+            const audioTrack = local.getAudioTracks()[0];
+            const videoTrack = local.getVideoTracks()[0];
+            if (audioTrack) void audioTx.sender.replaceTrack(audioTrack);
+            if (videoTrack) void videoTx.sender.replaceTrack(videoTrack);
         }
 
         pc.onicecandidate = (event) => {
@@ -319,25 +411,29 @@ export function useMeetingRoom(
                 stream = new MediaStream();
                 remoteStreamsRef.current.set(remoteId, stream);
             }
-            const tracks = event.streams[0]?.getTracks() ?? (event.track ? [event.track] : []);
-            for (const track of tracks) {
-                if (!track) continue;
-                if (track.kind === "video") {
-                    for (const existing of stream.getVideoTracks()) {
-                        if (existing.id !== track.id) stream.removeTrack(existing);
+            const incoming = event.track;
+            if (incoming) {
+                if (incoming.kind === "video") {
+                    for (const existingTrack of stream.getVideoTracks()) {
+                        if (existingTrack.id !== incoming.id) stream.removeTrack(existingTrack);
                     }
                 }
-                if (!stream.getTrackById(track.id)) stream.addTrack(track);
-                track.enabled = true;
-                track.onunmute = () => publishTiles();
-                track.onmute = () => publishTiles();
-                track.onended = () => {
-                    if (stream.getTrackById(track.id)) stream.removeTrack(track);
+                if (incoming.kind === "audio") {
+                    for (const existingTrack of stream.getAudioTracks()) {
+                        if (existingTrack.id !== incoming.id) stream.removeTrack(existingTrack);
+                    }
+                }
+                if (!stream.getTrackById(incoming.id)) stream.addTrack(incoming);
+                incoming.enabled = true;
+                incoming.onunmute = () => publishTiles();
+                incoming.onmute = () => publishTiles();
+                incoming.onended = () => {
+                    if (stream.getTrackById(incoming.id)) stream.removeTrack(incoming);
                     publishTiles();
                 };
                 if (
-                    track.kind === "video" &&
-                    (peerSharingRef.current.has(remoteId) || trackLooksLikeScreen(track))
+                    incoming.kind === "video" &&
+                    (peerSharingRef.current.has(remoteId) || trackLooksLikeScreen(incoming))
                 ) {
                     setStagePeerId(remoteId);
                 }
@@ -806,6 +902,8 @@ export function useMeetingRoom(
         hasLocalMedia,
         isFullscreen,
         connectionHint,
+        speakingIds,
+        localSpeaking,
         enableMedia,
         toggleMute,
         toggleCam,

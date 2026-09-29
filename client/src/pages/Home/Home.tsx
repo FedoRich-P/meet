@@ -3,11 +3,7 @@ import { useDispatch } from "react-redux";
 import { useNavigate } from "react-router";
 import { setRoom, setUser } from "../../entities";
 import { PATH } from "../../app/paths";
-import {
-    createMeetingId,
-    formatMeetingTitle,
-    saveMeetingTitle,
-} from "../../shared/lib/meetingMeta.ts";
+import { createMeetingIdFromTitle, saveMeetingTitle } from "../../shared/lib/meetingMeta.ts";
 
 const MEET_NOTICE_MS = 60_000;
 
@@ -36,11 +32,11 @@ export function Home() {
         return () => window.clearTimeout(timer);
     }, [notice]);
 
-    function enterMeeting(meetingId: string, name: string, title?: string, asOrganizer?: boolean) {
+    function enterMeeting(meetingId: string, name: string, title: string, asOrganizer?: boolean) {
         localStorage.setItem("user", name);
         dispatch(setUser(name));
         dispatch(setRoom(meetingId));
-        if (title) saveMeetingTitle(meetingId, title);
+        saveMeetingTitle(meetingId, title);
         if (asOrganizer) {
             localStorage.setItem(`meet_org:${meetingId}`, name);
         }
@@ -51,14 +47,20 @@ export function Home() {
         e.preventDefault();
         setError(null);
         const name = userName.trim();
+        const title = meetingTitleInput.trim();
         if (!name) {
             setError("Введите имя");
             return;
         }
-        const now = new Date();
-        const meetingId = createMeetingId(name, now);
-        const custom = meetingTitleInput.trim();
-        const title = custom || formatMeetingTitle(name, now);
+        if (!title) {
+            setError("Введите название встречи");
+            return;
+        }
+        if (title.length < 2) {
+            setError("Название слишком короткое");
+            return;
+        }
+        const meetingId = createMeetingIdFromTitle(title);
         enterMeeting(meetingId, name, title, true);
     }
 
@@ -103,14 +105,18 @@ export function Home() {
                     <form onSubmit={handleCreate} className="flex flex-col gap-3">
                         <label className="block">
                             <span className="mb-1.5 block text-xs font-medium uppercase tracking-wide text-tg-text-muted">
-                                Название встречи (необязательно)
+                                Название встречи
                             </span>
                             <input
                                 value={meetingTitleInput}
                                 onChange={(e) => setMeetingTitleInput(e.target.value)}
-                                placeholder="Если пусто — имя и время создания"
+                                placeholder="Например: Стендап команды"
+                                required
                                 className="w-full rounded-xl border border-tg-surface-2 bg-tg-bg px-4 py-3 text-tg-text outline-none transition placeholder:text-tg-text-muted focus:border-tg-accent"
                             />
+                            <span className="mt-1.5 block text-[11px] text-tg-text-muted">
+                                Попадёт в ссылку: /m/stendap-komandy-…
+                            </span>
                         </label>
                         <button
                             type="submit"

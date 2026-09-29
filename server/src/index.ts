@@ -165,9 +165,7 @@ function countInRoom(room: string): number {
 }
 
 function endMeeting(room: string, reason: string): void {
-    const timer = aloneTimers.get(room);
-    if (timer) clearTimeout(timer);
-    aloneTimers.delete(room);
+    clearAloneTimer(room);
     io.to(room).emit("meetingEnded", { room, reason });
     for (const [id, user] of users) {
         if (user.room === room) users.delete(id);
@@ -175,17 +173,30 @@ function endMeeting(room: string, reason: string): void {
     meetingMeta.delete(room);
 }
 
-function scheduleAloneEnd(room: string): void {
+function clearAloneTimer(room: string): void {
     const prev = aloneTimers.get(room);
     if (prev) clearTimeout(prev);
     aloneTimers.delete(room);
-    if (countInRoom(room) !== 1) return;
+}
+
+function scheduleAloneEnd(room: string, delayMs = 60_000, warn = true): void {
+    clearAloneTimer(room);
+    if (countInRoom(room) !== 1) {
+        io.to(room).emit("aloneCleared", { room });
+        return;
+    }
+    if (warn) {
+        io.to(room).emit("aloneWarning", {
+            room,
+            secondsLeft: Math.round(delayMs / 1000),
+        });
+    }
     const timer = setTimeout(() => {
         aloneTimers.delete(room);
         if (countInRoom(room) === 1) {
             endMeeting(room, "Встреча завершена: остался один участник");
         }
-    }, 60_000);
+    }, delayMs);
     aloneTimers.set(room, timer);
 }
 
@@ -222,6 +233,38 @@ app.get("/api/health", (_req: Request, res: Response) => {
         ok: true,
         mongo: isDbReady() ? "connected" : MONGODB_URI ? "connecting-or-failed" : "disabled",
     });
+});
+
+app.get("/api/ice", async (_req: Request, res: Response) => {
+    type IceServerType = {
+        urls: string | string[];
+        username?: string;
+        credential?: string;
+    };
+    const fallback: IceServerType[] = [
+        { urls: "stun:stun.l.google.com:19302" },
+        { urls: "stun:stun1.l.google.com:19302" },
+        { urls: "stun:stun.cloudflare.com:3478" },
+    ];
+    const meteredKey = process.env.METERED_API_KEY?.trim();
+    if (!meteredKey) {
+        return res.json({ iceServers: fallback });
+    }
+    try {
+        const url = `https://meet.metered.live/api/v1/turn/credentials?apiKey=${encodeURIComponent(meteredKey)}`;
+        const response = await fetch(url);
+        if (!response.ok) {
+            console.warn("Metered TURN credentials failed", response.status);
+            return res.json({ iceServers: fallback });
+        }
+        const data = (await response.json()) as IceServerType[] | { iceServers?: IceServerType[] };
+        const iceServers = Array.isArray(data) ? data : data.iceServers;
+        if (!iceServers?.length) return res.json({ iceServers: fallback });
+        return res.json({ iceServers: [...fallback, ...iceServers] });
+    } catch (err) {
+        console.warn("Metered TURN fetch error", err);
+        return res.json({ iceServers: fallback });
+    }
 });
 
 app.get("/api/messages", async (req: Request, res: Response) => {
@@ -327,6 +370,21 @@ io.on("connection", (socket: Socket) => {
             (meta!.organizerSocketId === socket.id || user?.name === meta!.organizerName);
         if (!isOrg) return;
         endMeeting(room, "Организатор завершил встречу");
+    });
+
+    socket.on("extendAlone", ({ room }: { room: string }) => {
+        const user = users.get(socket.id);
+        if (!user || user.room !== room) return;
+        if (countInRoom(room) !== 1) return;
+        scheduleAloneEnd(room, 5 * 60_000, true);
+        socket.emit("aloneExtended", { room, secondsLeft: 300 });
+    });
+
+    socket.on("closeAloneRoom", ({ room }: { room: string }) => {
+        const user = users.get(socket.id);
+        if (!user || user.room !== room) return;
+        if (countInRoom(room) !== 1) return;
+        endMeeting(room, "Встреча закрыта");
     });
 
     socket.on("muteAll", ({ room }: { room: string }) => {

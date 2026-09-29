@@ -51,6 +51,7 @@ export function MeetingShell({ meetingId, onLeave }: MeetingShellProps) {
     const [organizerSocketId, setOrganizerSocketId] = useState("");
     const [unread, setUnread] = useState(0);
     const [dmPeer, setDmPeer] = useState<{ id: string; name: string } | null>(null);
+    const [aloneSeconds, setAloneSeconds] = useState<number | null>(null);
 
     const shareUrl = getMeetingShareUrl(meetingId);
     const chatVisible = chatOpen;
@@ -161,6 +162,42 @@ export function MeetingShell({ meetingId, onLeave }: MeetingShellProps) {
         if (chatVisible) setUnread(0);
     }, [chatVisible]);
 
+    useEffect(() => {
+        const onWarn = ({ room, secondsLeft }: { room: string; secondsLeft: number }) => {
+            if (room !== meetingId) return;
+            setAloneSeconds(secondsLeft);
+        };
+        const onExtended = ({ room, secondsLeft }: { room: string; secondsLeft: number }) => {
+            if (room !== meetingId) return;
+            setAloneSeconds(secondsLeft);
+        };
+        const onCleared = ({ room }: { room: string }) => {
+            if (room !== meetingId) return;
+            setAloneSeconds(null);
+        };
+        socket.on("aloneWarning", onWarn);
+        socket.on("aloneExtended", onExtended);
+        socket.on("aloneCleared", onCleared);
+        return () => {
+            socket.off("aloneWarning", onWarn);
+            socket.off("aloneExtended", onExtended);
+            socket.off("aloneCleared", onCleared);
+        };
+    }, [socket, meetingId]);
+
+    useEffect(() => {
+        if (aloneSeconds == null) return;
+        const timer = window.setInterval(() => {
+            setAloneSeconds((prev) => {
+                if (prev == null || prev <= 1) return prev;
+                return prev - 1;
+            });
+        }, 1000);
+        return () => window.clearInterval(timer);
+        // restart only when dialog appears / disappears
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [aloneSeconds == null]);
+
     async function copyLink() {
         try {
             await navigator.clipboard.writeText(shareUrl);
@@ -181,6 +218,16 @@ export function MeetingShell({ meetingId, onLeave }: MeetingShellProps) {
         const ok = window.confirm("Завершить встречу для всех участников?");
         if (!ok) return;
         socket.emit("endMeeting", { room: meetingId });
+    }
+
+    function extendAlone() {
+        socket.emit("extendAlone", { room: meetingId });
+    }
+
+    function closeAloneRoom() {
+        socket.emit("closeAloneRoom", { room: meetingId });
+        setAloneSeconds(null);
+        onLeave();
     }
 
     const callPanel = localSocketId ? (
@@ -335,6 +382,42 @@ export function MeetingShell({ meetingId, onLeave }: MeetingShellProps) {
                     </button>
                 ))}
             </nav>
+
+            {aloneSeconds != null && aloneSeconds > 0 && (
+                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 px-4">
+                    <div
+                        role="dialog"
+                        aria-modal="true"
+                        className="w-full max-w-sm rounded-2xl border border-tg-surface-2 bg-tg-surface p-5 shadow-2xl"
+                    >
+                        <h2 className="text-lg font-semibold text-tg-text">Вы остались одни</h2>
+                        <p className="mt-2 text-sm leading-relaxed text-tg-text-muted">
+                            Во встрече один участник. Встреча закроется через{" "}
+                            <span className="font-semibold text-tg-warning">
+                                {Math.floor(aloneSeconds / 60)}:
+                                {String(aloneSeconds % 60).padStart(2, "0")}
+                            </span>
+                            .
+                        </p>
+                        <div className="mt-5 flex flex-col gap-2">
+                            <button
+                                type="button"
+                                onClick={extendAlone}
+                                className="w-full rounded-xl bg-tg-accent py-3 text-sm font-semibold text-white hover:bg-tg-accent-hover"
+                            >
+                                Подождать ещё 5 минут
+                            </button>
+                            <button
+                                type="button"
+                                onClick={closeAloneRoom}
+                                className="w-full rounded-xl bg-tg-danger py-3 text-sm font-semibold text-white hover:bg-tg-danger-hover"
+                            >
+                                Закрыть встречу
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
         </div>
     );
 }

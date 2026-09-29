@@ -12,3 +12,5 @@ services:
         sync: false
       - key: MONGODB_URI
         sync: false
+      - key: METERED_API_KEY
+        sync: false

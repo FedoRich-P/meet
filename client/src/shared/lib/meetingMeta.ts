@@ -41,6 +41,13 @@ export function createMeetingId(creatorName: string, date = new Date()): string 
     return `${slugifyName(creatorName)}-${formatMeetingStamp(date)}`;
 }
 
+/** Meeting URL segment from required title, e.g. "Стендап" → "stendap-a3f2" */
+export function createMeetingIdFromTitle(title: string): string {
+    const slug = slugifyName(title).slice(0, 48);
+    const suffix = Math.random().toString(36).slice(2, 6);
+    return `${slug || "meet"}-${suffix}`;
+}
+
 const TITLE_KEY = "meet_title:";
 
 export function saveMeetingTitle(meetingId: string, title: string): void {

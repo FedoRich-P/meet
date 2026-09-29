@@ -41,6 +41,8 @@ export function CallPanel({
         hasLocalMedia,
         isFullscreen,
         connectionHint,
+        speakingIds,
+        localSpeaking,
         enableMedia,
         toggleMute,
         toggleCam,
@@ -68,6 +70,7 @@ export function CallPanel({
         window.dispatchEvent(new CustomEvent("meet-unlock-audio"));
     }
 
+    const remoteTiles = tiles.filter((t) => !t.isLocal);
     const stageTile =
         tiles.find((t) => t.id === stagePeerId) ??
         tiles.find((t) => t.isSharing) ??
@@ -79,6 +82,12 @@ export function CallPanel({
 
     return (
         <div id="meet-stage" className="relative h-full w-full overflow-hidden bg-black">
+            <RemoteAudioLayer
+                remotes={remoteTiles}
+                soundOff={remoteSoundOff}
+                onBlocked={() => setNeedsAudioTap(true)}
+            />
+
             <div className="absolute left-3 top-3 z-20 max-w-[40%] rounded-lg bg-black/60 px-2 py-1 text-[11px] text-white/90">
                 {connectionHint}
             </div>
@@ -92,7 +101,7 @@ export function CallPanel({
                 role="presentation"
             >
                 {stageTile ? (
-                    <TileVideo tile={stageTile} variant="stage" soundOff={remoteSoundOff} />
+                    <TileVideo tile={stageTile} variant="stage" speaking={speakingIds.has(stageTile.id)} />
                 ) : (
                     <div className="flex h-full flex-col items-center justify-center gap-3 px-6 text-center">
                         <p className="text-lg font-semibold text-white">{localUserName}</p>
@@ -117,6 +126,7 @@ export function CallPanel({
                     <div className="pointer-events-none absolute bottom-24 left-3 z-20 rounded-lg bg-black/55 px-2 py-1 text-xs text-white">
                         {stageTile.name}
                         {stageTile.isSharing ? " · экран" : ""}
+                        {speakingIds.has(stageTile.id) ? " · говорит" : ""}
                         {!stageTile.isLocal &&
                         stageTile.connection !== "на связи" &&
                         stageTile.connection !== "подключение…"
@@ -125,7 +135,7 @@ export function CallPanel({
                     </div>
                 )}
 
-                {needsAudioTap && stageTile && !stageTile.isLocal && (
+                {needsAudioTap && remoteTiles.length > 0 && (
                     <button
                         type="button"
                         onClick={(e) => {
@@ -142,21 +152,27 @@ export function CallPanel({
             {stripTiles.length > 0 && (
                 <div className="absolute bottom-24 right-3 z-20 flex max-w-[70%] flex-col items-end gap-1">
                     <div className="flex gap-2 overflow-x-auto">
-                    {stripTiles.map((tile) => (
-                        <button
-                            key={tile.id}
-                            type="button"
-                            onClick={() => setStagePeerId(tile.id)}
-                            className={`relative h-20 w-32 shrink-0 overflow-hidden rounded-xl ring-2 transition hover:ring-tg-accent ${
-                                tile.audioEnabled ? "ring-tg-online" : "ring-white/20"
-                            }`}
-                        >
-                            <TileVideo tile={tile} variant="thumb" soundOff={remoteSoundOff} />
-                            <span className="absolute inset-x-0 bottom-0 truncate bg-black/60 px-1 py-0.5 text-[10px] text-white">
-                                {tile.name}
-                            </span>
-                        </button>
-                    ))}
+                        {stripTiles.map((tile) => (
+                            <button
+                                key={tile.id}
+                                type="button"
+                                onClick={() => setStagePeerId(tile.id)}
+                                className={`relative h-20 w-32 shrink-0 overflow-hidden rounded-xl ring-2 transition hover:ring-tg-accent ${
+                                    speakingIds.has(tile.id)
+                                        ? "animate-pulse ring-tg-online"
+                                        : "ring-white/20"
+                                }`}
+                            >
+                                <TileVideo
+                                    tile={tile}
+                                    variant="thumb"
+                                    speaking={speakingIds.has(tile.id)}
+                                />
+                                <span className="absolute inset-x-0 bottom-0 truncate bg-black/60 px-1 py-0.5 text-[10px] text-white">
+                                    {tile.name}
+                                </span>
+                            </button>
+                        ))}
                     </div>
                     <p className="px-1 text-[11px] text-white/90">Нажмите, чтобы увеличить</p>
                 </div>
@@ -173,7 +189,7 @@ export function CallPanel({
                     <ControlButton
                         onClick={() => void toggleMute()}
                         danger={isMuted}
-                        active={!isMuted}
+                        speaking={!isMuted && localSpeaking}
                         label={isMuted ? "Микрофон выкл." : "Микрофон"}
                     >
                         {isMuted ? <FaMicrophoneSlash /> : <FaMicrophone />}
@@ -196,7 +212,10 @@ export function CallPanel({
                     </ControlButton>
 
                     <ControlButton
-                        onClick={toggleRemoteSound}
+                        onClick={() => {
+                            toggleRemoteSound();
+                            unlockRemoteAudio();
+                        }}
                         danger={remoteSoundOff}
                         label={remoteSoundOff ? "Включить звук" : "Выключить звук"}
                     >
@@ -225,6 +244,67 @@ export function CallPanel({
     );
 }
 
+/** Always play every remote audio track — not only the stage tile. */
+function RemoteAudioLayer({
+    remotes,
+    soundOff,
+    onBlocked,
+}: {
+    remotes: PeerTileType[];
+    soundOff: boolean;
+    onBlocked: () => void;
+}) {
+    return (
+        <div className="pointer-events-none absolute h-0 w-0 overflow-hidden" aria-hidden>
+            {remotes.map((tile) => (
+                <RemoteAudio
+                    key={`${tile.id}-${tile.audioTrackId}`}
+                    stream={tile.stream}
+                    soundOff={soundOff}
+                    onBlocked={onBlocked}
+                />
+            ))}
+        </div>
+    );
+}
+
+function RemoteAudio({
+    stream,
+    soundOff,
+    onBlocked,
+}: {
+    stream: MediaStream | null;
+    soundOff: boolean;
+    onBlocked: () => void;
+}) {
+    const audioRef = useRef<HTMLAudioElement | null>(null);
+
+    useEffect(() => {
+        const audio = audioRef.current;
+        if (!audio || !stream) return;
+
+        const play = () => {
+            audio.srcObject = stream;
+            audio.muted = soundOff;
+            audio.volume = soundOff ? 0 : 1;
+            void audio.play().catch(() => onBlocked());
+        };
+
+        play();
+        const onUnlock = () => play();
+        stream.addEventListener("addtrack", play);
+        stream.addEventListener("removetrack", play);
+        window.addEventListener("meet-unlock-audio", onUnlock);
+        return () => {
+            stream.removeEventListener("addtrack", play);
+            stream.removeEventListener("removetrack", play);
+            window.removeEventListener("meet-unlock-audio", onUnlock);
+        };
+    }, [stream, soundOff, onBlocked]);
+
+    return <audio ref={audioRef} autoPlay playsInline />;
+}
+
 function videoFitClass(tile: PeerTileType, variant: "stage" | "thumb"): string {
     if (tile.isSharing) return "object-contain";
     if (!tile.isLocal) return "object-contain";
@@ -234,24 +314,20 @@ function videoFitClass(tile: PeerTileType, variant: "stage" | "thumb"): string {
 function TileVideo({
     tile,
     variant,
-    soundOff,
+    speaking,
 }: {
     tile: PeerTileType;
     variant: "stage" | "thumb";
-    soundOff: boolean;
+    speaking: boolean;
 }) {
     const videoRef = useRef<HTMLVideoElement | null>(null);
-    const audioRef = useRef<HTMLAudioElement | null>(null);
-    const playRemoteAudio = !tile.isLocal && variant === "stage";
 
     useEffect(() => {
         const video = videoRef.current;
-        const audio = audioRef.current;
         const stream = tile.stream;
-        if (!stream) return;
+        if (!video || !stream) return;
 
         const attachVideo = () => {
-            if (!video) return;
             video.srcObject = stream;
             video.muted = true;
             video.defaultMuted = true;
@@ -259,45 +335,22 @@ function TileVideo({
             void video.play().catch(() => undefined);
         };
 
-        const attachAudio = () => {
-            if (!playRemoteAudio || !audio) return;
-            audio.srcObject = stream;
-            audio.muted = soundOff;
-            audio.volume = soundOff ? 0 : 1;
-            void audio.play().catch(() => {
-                window.dispatchEvent(new CustomEvent("meet-audio-blocked"));
-            });
-        };
-
-        const syncTracks = () => {
-            attachVideo();
-            attachAudio();
-        };
-
-        syncTracks();
-        stream.addEventListener("addtrack", syncTracks);
-        stream.addEventListener("removetrack", syncTracks);
-
-        const onUnlock = () => {
-            attachAudio();
-        };
-        window.addEventListener("meet-unlock-audio", onUnlock);
+        attachVideo();
+        stream.addEventListener("addtrack", attachVideo);
+        stream.addEventListener("removetrack", attachVideo);
         return () => {
-            stream.removeEventListener("addtrack", syncTracks);
-            stream.removeEventListener("removetrack", syncTracks);
-            window.removeEventListener("meet-unlock-audio", onUnlock);
+            stream.removeEventListener("addtrack", attachVideo);
+            stream.removeEventListener("removetrack", attachVideo);
         };
-    }, [tile.stream, tile.isLocal, tile.videoTrackId, tile.audioTrackId, soundOff, playRemoteAudio]);
+    }, [tile.stream, tile.videoTrackId]);
 
     const waitingShare = tile.isSharing && !tile.videoEnabled;
     const showAvatar = (!tile.videoEnabled || !tile.stream) && !tile.isSharing;
 
-    const activeRing = tile.audioEnabled && (tile.isLocal || variant === "stage");
-
     return (
         <div
             className={`relative h-full w-full bg-black ${
-                activeRing ? "ring-2 ring-inset ring-tg-online" : ""
+                speaking ? "ring-2 ring-inset ring-tg-online animate-pulse" : ""
             }`}
         >
             <video
@@ -309,9 +362,6 @@ function TileVideo({
                     showAvatar ? "opacity-0" : "opacity-100"
                 }`}
             />
-            {playRemoteAudio && (
-                <audio ref={audioRef} autoPlay playsInline className="hidden" aria-hidden />
-            )}
             {waitingShare && (
                 <div className="absolute inset-0 flex items-center justify-center bg-black/80 px-2 text-center text-[11px] text-white/80">
                     Подключение экрана…
@@ -322,7 +372,7 @@ function TileVideo({
                     <div
                         className={`flex items-center justify-center rounded-full bg-tg-bubble-out font-bold uppercase text-white ${
                             variant === "stage" ? "h-28 w-28 text-4xl" : "h-12 w-12 text-lg"
-                        }`}
+                        } ${speaking ? "ring-4 ring-tg-online" : ""}`}
                     >
                         {tile.name.replace(/\s*\(вы\)\s*/i, "").slice(0, 1) || "?"}
                     </div>
@@ -338,14 +388,14 @@ function ControlButton({
     label,
     disabled,
     danger,
-    active,
+    speaking,
 }: {
     children: ReactNode;
     onClick: () => void;
     label: string;
     disabled?: boolean;
     danger?: boolean;
-    active?: boolean;
+    speaking?: boolean;
 }) {
     return (
         <button
@@ -357,8 +407,8 @@ function ControlButton({
             className={`inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-full p-0 leading-none transition disabled:opacity-40 sm:h-12 sm:w-12 [&_svg]:block [&_svg]:h-[18px] [&_svg]:w-[18px] ${
                 danger
                     ? "bg-tg-danger text-white hover:bg-tg-danger-hover"
-                    : active
-                      ? "bg-tg-surface-2 text-tg-text ring-2 ring-tg-online hover:bg-tg-panel"
+                    : speaking
+                      ? "animate-pulse bg-tg-online text-white ring-2 ring-tg-online/80"
                       : "bg-tg-surface-2 text-tg-text hover:bg-tg-panel"
             }`}
         >
