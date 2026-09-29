@@ -1,8 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
 import {
     FaCheck,
-    FaChevronLeft,
-    FaChevronRight,
     FaComments,
     FaCopy,
     FaTimes,
@@ -374,12 +372,9 @@ export function MeetingShell({ meetingId, onLeave }: MeetingShellProps) {
                         aria-orientation="vertical"
                         aria-label="Изменить ширину панели"
                         onPointerDown={startResize}
-                        className="group absolute inset-y-0 left-0 z-20 hidden w-3 -translate-x-1/2 cursor-col-resize items-center justify-center md:flex"
+                        className="group absolute inset-y-0 -left-1 z-20 hidden w-2 cursor-col-resize items-center justify-center md:flex"
                     >
-                        <span className="flex h-10 items-center gap-0.5 rounded-full bg-tg-surface-2 px-0.5 text-[9px] text-tg-text-muted opacity-35 transition group-hover:bg-tg-panel group-hover:text-tg-accent group-hover:opacity-100 group-active:opacity-100">
-                            <FaChevronLeft className="h-2.5 w-2.5" />
-                            <FaChevronRight className="h-2.5 w-2.5" />
-                        </span>
+                        <span className="pointer-events-none h-14 w-1 rounded-full bg-white/25 transition group-hover:h-16 group-hover:bg-tg-accent" />
                     </div>
 
                     {peopleVisible ? (

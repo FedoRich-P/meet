@@ -16,8 +16,9 @@ export function Meeting() {
     const storedName = useSelector(userNameSelector);
     const room = useSelector((state: RootState) => state.user.room);
 
+    /** Prefill only — do not auto-join until user submits the gate form */
     const [nameInput, setNameInput] = useState(() => localStorage.getItem("user") ?? "");
-    const [joined, setJoined] = useState(false);
+    const [gatePassed, setGatePassed] = useState(false);
     const joinedRef = useRef(false);
 
     useEffect(() => {
@@ -26,19 +27,21 @@ export function Meeting() {
             return;
         }
         dispatch(setRoom(meetingId));
+        joinedRef.current = false;
+        setGatePassed(false);
     }, [meetingId, dispatch, navigate]);
 
     useEffect(() => {
-        if (!meetingId || !storedName) return;
+        if (!gatePassed || !meetingId || !storedName) return;
         if (room !== meetingId) return;
 
         const isOrganizer = localStorage.getItem(`meet_org:${meetingId}`) === storedName;
 
         const join = () => {
+            if (joinedRef.current) return;
             const title = localStorage.getItem(`meet_title:${meetingId}`) || undefined;
             socket.emit("newUser", { name: storedName, room: meetingId, title, isOrganizer });
             joinedRef.current = true;
-            setJoined(true);
         };
 
         if (socket.connected) {
@@ -63,7 +66,7 @@ export function Meeting() {
             socket.off("connect", join);
             socket.off("connect", onReconnect);
         };
-    }, [meetingId, storedName, room, socket]);
+    }, [gatePassed, meetingId, storedName, room, socket]);
 
     useEffect(() => {
         const onEnded = ({ room, reason }: { room: string; reason: string }) => {
@@ -75,7 +78,7 @@ export function Meeting() {
             }
             dispatch(clearMessages());
             joinedRef.current = false;
-            setJoined(false);
+            setGatePassed(false);
             navigate(PATH.HOME);
         };
         socket.on("meetingEnded", onEnded);
@@ -92,19 +95,20 @@ export function Meeting() {
         localStorage.setItem("user", name);
         dispatch(setUser(name));
         dispatch(setRoom(meetingId));
+        setGatePassed(true);
     }
 
     function handleLeave() {
         socket.emit("leaveChat");
         dispatch(clearMessages());
         joinedRef.current = false;
-        setJoined(false);
+        setGatePassed(false);
         navigate(PATH.HOME);
     }
 
     if (!meetingId) return null;
 
-    if (!storedName || !joined) {
+    if (!gatePassed || !storedName) {
         return (
             <div className="flex min-h-full items-center justify-center bg-tg-bg px-4">
                 <form
@@ -122,6 +126,7 @@ export function Meeting() {
                         placeholder="Ваше имя"
                         className="mt-5 w-full rounded-xl border border-tg-surface-2 bg-tg-bg px-4 py-3 text-tg-text outline-none focus:border-tg-accent"
                         autoFocus
+                        autoComplete="nickname"
                     />
                     <button
                         type="submit"

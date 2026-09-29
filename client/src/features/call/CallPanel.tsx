@@ -11,6 +11,7 @@ import {
     FaVolumeMute,
     FaVolumeUp,
 } from "react-icons/fa";
+import { MdOutlinePhoneInTalk, MdOutlinePhonelinkRing } from "react-icons/md";
 import { useMeetingRoom, type PeerTileType } from "../chat/model/useMeetingRoom.ts";
 
 type CallPanelProps = {
@@ -50,6 +51,8 @@ export function CallPanel({
         toggleFullscreen,
         remoteSoundOff,
         toggleRemoteSound,
+        speakerphone,
+        toggleSpeakerphone,
     } = useMeetingRoom(localUserId, localUserName, roomId);
 
     const [needsAudioTap, setNeedsAudioTap] = useState(false);
@@ -85,6 +88,7 @@ export function CallPanel({
             <RemoteAudioLayer
                 remotes={remoteTiles}
                 soundOff={remoteSoundOff}
+                speakerphone={speakerphone}
                 onBlocked={() => setNeedsAudioTap(true)}
             />
 
@@ -223,6 +227,17 @@ export function CallPanel({
                     </ControlButton>
 
                     <ControlButton
+                        onClick={() => {
+                            toggleSpeakerphone();
+                            unlockRemoteAudio();
+                        }}
+                        active={speakerphone}
+                        label={speakerphone ? "Громкая связь вкл." : "Громкая связь выкл."}
+                    >
+                        {speakerphone ? <MdOutlinePhonelinkRing /> : <MdOutlinePhoneInTalk />}
+                    </ControlButton>
+
+                    <ControlButton
                         onClick={toggleFullscreen}
                         label={isFullscreen ? "Свернуть" : "На весь экран"}
                     >
@@ -248,10 +263,12 @@ export function CallPanel({
 function RemoteAudioLayer({
     remotes,
     soundOff,
+    speakerphone,
     onBlocked,
 }: {
     remotes: PeerTileType[];
     soundOff: boolean;
+    speakerphone: boolean;
     onBlocked: () => void;
 }) {
     return (
@@ -261,6 +278,7 @@ function RemoteAudioLayer({
                     key={`${tile.id}-${tile.audioTrackId}`}
                     stream={tile.stream}
                     soundOff={soundOff}
+                    speakerphone={speakerphone}
                     onBlocked={onBlocked}
                 />
             ))}
@@ -271,10 +289,12 @@ function RemoteAudioLayer({
 function RemoteAudio({
     stream,
     soundOff,
+    speakerphone,
     onBlocked,
 }: {
     stream: MediaStream | null;
     soundOff: boolean;
+    speakerphone: boolean;
     onBlocked: () => void;
 }) {
     const audioRef = useRef<HTMLAudioElement | null>(null);
@@ -283,24 +303,45 @@ function RemoteAudio({
         const audio = audioRef.current;
         if (!audio || !stream) return;
 
+        const applySink = async () => {
+            const el = audio as HTMLAudioElement & {
+                setSinkId?: (id: string) => Promise<void>;
+            };
+            if (!el.setSinkId) return;
+            try {
+                await el.setSinkId(speakerphone ? "default" : "communications");
+            } catch {
+                try {
+                    await el.setSinkId("default");
+                } catch {
+                    // browser may ignore sink selection
+                }
+            }
+        };
+
         const play = () => {
             audio.srcObject = stream;
             audio.muted = soundOff;
-            audio.volume = soundOff ? 0 : 1;
+            // Slightly below 1.0 reduces feedback/echo with speakers
+            audio.volume = soundOff ? 0 : speakerphone ? 1 : 0.85;
+            void applySink();
             void audio.play().catch(() => onBlocked());
         };
 
         play();
         const onUnlock = () => play();
+        const onSpeaker = () => play();
         stream.addEventListener("addtrack", play);
         stream.addEventListener("removetrack", play);
         window.addEventListener("meet-unlock-audio", onUnlock);
+        window.addEventListener("meet-speakerphone", onSpeaker);
         return () => {
             stream.removeEventListener("addtrack", play);
             stream.removeEventListener("removetrack", play);
             window.removeEventListener("meet-unlock-audio", onUnlock);
+            window.removeEventListener("meet-speakerphone", onSpeaker);
         };
-    }, [stream, soundOff, onBlocked]);
+    }, [stream, soundOff, speakerphone, onBlocked]);
 
     return <audio ref={audioRef} autoPlay playsInline />;
 }
@@ -389,6 +430,7 @@ function ControlButton({
     disabled,
     danger,
     speaking,
+    active,
 }: {
     children: ReactNode;
     onClick: () => void;
@@ -396,6 +438,7 @@ function ControlButton({
     disabled?: boolean;
     danger?: boolean;
     speaking?: boolean;
+    active?: boolean;
 }) {
     return (
         <button
@@ -409,7 +452,9 @@ function ControlButton({
                     ? "bg-tg-danger text-white hover:bg-tg-danger-hover"
                     : speaking
                       ? "animate-pulse bg-tg-online text-white ring-2 ring-tg-online/80"
-                      : "bg-tg-surface-2 text-tg-text hover:bg-tg-panel"
+                      : active
+                        ? "bg-tg-surface-2 text-tg-text ring-2 ring-tg-accent hover:bg-tg-panel"
+                        : "bg-tg-surface-2 text-tg-text hover:bg-tg-panel"
             }`}
         >
             {children}

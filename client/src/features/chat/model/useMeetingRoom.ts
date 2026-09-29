@@ -42,6 +42,8 @@ type UseMeetingRoomResult = {
     toggleFullscreen: () => void;
     remoteSoundOff: boolean;
     toggleRemoteSound: () => void;
+    speakerphone: boolean;
+    toggleSpeakerphone: () => void;
 };
 
 const FALLBACK_ICE: RTCConfiguration = {
@@ -190,6 +192,7 @@ export function useMeetingRoom(
     const [hasLocalMedia, setHasLocalMedia] = useState(false);
     const [isFullscreen, setIsFullscreen] = useState(false);
     const [remoteSoundOff, setRemoteSoundOff] = useState(false);
+    const [speakerphone, setSpeakerphone] = useState(true);
     const [connectionHint, setConnectionHint] = useState("Подключение…");
     const [speakingIds, setSpeakingIds] = useState<Set<string>>(() => new Set());
     const [localSpeaking, setLocalSpeaking] = useState(false);
@@ -213,36 +216,62 @@ export function useMeetingRoom(
         const remoteSpeaking = new Map<string, boolean>();
 
         const resumeCtx = () => {
-            const ctx = analyseCtxRef.current;
-            if (ctx?.state === "suspended") void ctx.resume();
+            try {
+                if (!analyseCtxRef.current) {
+                    analyseCtxRef.current = new AudioContext();
+                }
+                if (analyseCtxRef.current.state === "suspended") {
+                    void analyseCtxRef.current.resume();
+                }
+            } catch {
+                // ignore
+            }
         };
         window.addEventListener("meet-unlock-audio", resumeCtx);
-        window.addEventListener("pointerdown", resumeCtx, { once: true });
+        window.addEventListener("pointerdown", resumeCtx);
 
         const onRemoteSpeaking = ({ from, speaking }: { from: string; speaking: boolean }) => {
             remoteSpeaking.set(from, speaking);
         };
         socket.on("speaking", onRemoteSpeaking);
 
-        const measureLocal = (): boolean => {
-            if (isMutedRef.current) return false;
-            const stream = localStreamRef.current;
-            if (!stream) return false;
-            const audioTracks = stream.getAudioTracks().filter((t) => t.enabled && t.readyState === "live");
-            if (audioTracks.length === 0) return false;
-            try {
-                if (!analyseCtxRef.current) {
-                    analyseCtxRef.current = new AudioContext();
+        async function levelFromSenderStats(): Promise<number> {
+            let best = 0;
+            for (const { pc } of peersRef.current.values()) {
+                const sender = pc.getSenders().find((s) => s.track?.kind === "audio" && s.track);
+                if (!sender) continue;
+                try {
+                    const stats = await sender.getStats();
+                    for (const report of stats.values()) {
+                        const level =
+                            typeof (report as { audioLevel?: number }).audioLevel === "number"
+                                ? (report as { audioLevel: number }).audioLevel
+                                : undefined;
+                        if (typeof level === "number" && level > best) best = level;
+                    }
+                } catch {
+                    // ignore
                 }
+            }
+            return best;
+        }
+
+        function levelFromAnalyser(): number {
+            const stream = localStreamRef.current;
+            if (!stream) return 0;
+            const audioTracks = stream.getAudioTracks().filter((t) => t.enabled && t.readyState === "live");
+            if (audioTracks.length === 0) return 0;
+            try {
+                resumeCtx();
                 const ctx = analyseCtxRef.current;
-                if (ctx.state === "suspended") void ctx.resume();
+                if (!ctx) return 0;
                 const trackId = audioTracks[0].id;
                 let holder = analyserHolders.get(stream);
                 if (!holder || holder.trackId !== trackId) {
-                    const source = ctx.createMediaStreamSource(new MediaStream([audioTracks[0]]));
+                    const source = ctx.createMediaStreamSource(stream);
                     const analyser = ctx.createAnalyser();
-                    analyser.fftSize = 512;
-                    analyser.smoothingTimeConstant = 0.3;
+                    analyser.fftSize = 1024;
+                    analyser.smoothingTimeConstant = 0.2;
                     source.connect(analyser);
                     holder = { source, analyser, trackId };
                     analyserHolders.set(stream, holder);
@@ -254,38 +283,60 @@ export function useMeetingRoom(
                     const v = (data[i] - 128) / 128;
                     sum += v * v;
                 }
-                const rms = Math.sqrt(sum / data.length);
-                return rms > 0.04;
+                return Math.sqrt(sum / data.length);
             } catch {
-                return false;
+                return 0;
             }
-        };
+        }
 
-        const tick = () => {
+        const loop = () => {
             if (stopped) return;
-            const localTalk = measureLocal();
-            setLocalSpeaking(localTalk);
+            void (async () => {
+                if (isMutedRef.current) {
+                    setLocalSpeaking(false);
+                    if (lastEmittedSpeaking) {
+                        lastEmittedSpeaking = false;
+                        socket.emit("speaking", { room: roomId, speaking: false });
+                    }
+                    const next = new Set<string>();
+                    for (const [id, speaking] of remoteSpeaking) {
+                        if (speaking) next.add(id);
+                    }
+                    setSpeakingIds((prev) => {
+                        if (prev.size === next.size && [...prev].every((id) => next.has(id))) return prev;
+                        return next;
+                    });
+                    return;
+                }
 
-            if (localTalk !== lastEmittedSpeaking) {
-                lastEmittedSpeaking = localTalk;
-                socket.emit("speaking", { room: roomId, speaking: localTalk });
-            }
-
-            const next = new Set<string>();
-            const localId = localUserIdRef.current || "local";
-            if (localTalk) next.add(localId);
-            for (const [id, speaking] of remoteSpeaking) {
-                if (speaking) next.add(id);
-            }
-
-            setSpeakingIds((prev) => {
-                if (prev.size === next.size && [...prev].every((id) => next.has(id))) return prev;
-                return next;
+                let level = levelFromAnalyser();
+                if (level < 0.015) {
+                    const statsLevel = await levelFromSenderStats();
+                    if (statsLevel > level) level = statsLevel;
+                }
+                // Desktop mics + AEC often report lower RMS — keep threshold low
+                const localTalk = level > 0.015;
+                setLocalSpeaking(localTalk);
+                if (localTalk !== lastEmittedSpeaking) {
+                    lastEmittedSpeaking = localTalk;
+                    socket.emit("speaking", { room: roomId, speaking: localTalk });
+                }
+                const next = new Set<string>();
+                const localId = localUserIdRef.current || "local";
+                if (localTalk) next.add(localId);
+                for (const [id, speaking] of remoteSpeaking) {
+                    if (speaking) next.add(id);
+                }
+                setSpeakingIds((prev) => {
+                    if (prev.size === next.size && [...prev].every((id) => next.has(id))) return prev;
+                    return next;
+                });
+            })().finally(() => {
+                if (!stopped) timer = window.setTimeout(loop, 100);
             });
-            timer = window.setTimeout(tick, 100);
         };
 
-        timer = window.setTimeout(tick, 100);
+        loop();
         return () => {
             stopped = true;
             window.clearTimeout(timer);
@@ -363,7 +414,7 @@ export function useMeetingRoom(
             audio: {
                 echoCancellation: true,
                 noiseSuppression: true,
-                autoGainControl: false,
+                autoGainControl: true,
             },
             video: false,
         });
@@ -699,10 +750,16 @@ export function useMeetingRoom(
             const nextMuted = !isMutedRef.current;
             applyMute(nextMuted);
             if (!nextMuted) {
+                try {
+                    if (!analyseCtxRef.current) analyseCtxRef.current = new AudioContext();
+                    void analyseCtxRef.current.resume();
+                } catch {
+                    // ignore
+                }
                 window.dispatchEvent(new CustomEvent("meet-unlock-audio"));
-                void analyseCtxRef.current?.resume();
             } else {
                 socket.emit("speaking", { room: roomId, speaking: false });
+                setLocalSpeaking(false);
             }
             setMediaError(null);
         } catch (err) {
@@ -914,6 +971,17 @@ export function useMeetingRoom(
         });
     };
 
+    const toggleSpeakerphone = () => {
+        setSpeakerphone((prev) => {
+            const next = !prev;
+            window.dispatchEvent(
+                new CustomEvent("meet-speakerphone", { detail: { speakerphone: next } })
+            );
+            window.dispatchEvent(new CustomEvent("meet-unlock-audio"));
+            return next;
+        });
+    };
+
     const toggleFullscreen = () => {
         const el = document.getElementById("meet-stage");
         if (!el) return;
@@ -950,5 +1018,7 @@ export function useMeetingRoom(
         toggleFullscreen,
         remoteSoundOff,
         toggleRemoteSound,
+        speakerphone,
+        toggleSpeakerphone,
     };
 }
