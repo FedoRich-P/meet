@@ -23,8 +23,16 @@ export function Meeting() {
 
     useEffect(() => {
         if (!meetingId) {
-            navigate(PATH.HOME);
+            navigate(PATH.HOME, { replace: true });
             return;
+        }
+        try {
+            if (sessionStorage.getItem(`meet_ended:${meetingId}`)) {
+                navigate(PATH.HOME, { replace: true });
+                return;
+            }
+        } catch {
+            // ignore
         }
         dispatch(setRoom(meetingId));
         joinedRef.current = false;
@@ -73,13 +81,14 @@ export function Meeting() {
             if (room !== meetingId) return;
             try {
                 sessionStorage.setItem("meet_notice", reason);
+                sessionStorage.setItem(`meet_ended:${meetingId}`, "1");
             } catch {
                 // ignore
             }
             dispatch(clearMessages());
             joinedRef.current = false;
             setGatePassed(false);
-            navigate(PATH.HOME);
+            navigate(PATH.HOME, { replace: true });
         };
         socket.on("meetingEnded", onEnded);
         return () => {
@@ -103,7 +112,7 @@ export function Meeting() {
         dispatch(clearMessages());
         joinedRef.current = false;
         setGatePassed(false);
-        navigate(PATH.HOME);
+        navigate(PATH.HOME, { replace: true });
     }
 
     if (!meetingId) return null;

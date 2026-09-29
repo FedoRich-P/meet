@@ -10,7 +10,7 @@ interface Props {
     placeholder?: string;
 }
 
-const MIN_COMPOSER_HEIGHT = 90;
+const MIN_COMPOSER_HEIGHT = 70;
 const MAX_COMPOSER_HEIGHT = 250;
 
 export function ChatForm({ handleSubmit, setMessage, message, onAttach, attachError, placeholder = "Сообщение" }: Props) {

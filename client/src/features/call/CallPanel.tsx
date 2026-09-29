@@ -56,10 +56,19 @@ export function CallPanel({
     } = useMeetingRoom(localUserId, localUserName, roomId);
 
     const [needsAudioTap, setNeedsAudioTap] = useState(false);
+    const [isPhone, setIsPhone] = useState(false);
 
     useEffect(() => {
         void enableMedia().catch(() => undefined);
         // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
+
+    useEffect(() => {
+        const mq = window.matchMedia("(max-width: 767px), (pointer: coarse)");
+        const sync = () => setIsPhone(mq.matches);
+        sync();
+        mq.addEventListener("change", sync);
+        return () => mq.removeEventListener("change", sync);
     }, []);
 
     useEffect(() => {
@@ -226,16 +235,18 @@ export function CallPanel({
                         {remoteSoundOff ? <FaVolumeMute /> : <FaVolumeUp />}
                     </ControlButton>
 
-                    <ControlButton
-                        onClick={() => {
-                            toggleSpeakerphone();
-                            unlockRemoteAudio();
-                        }}
-                        active={speakerphone}
-                        label={speakerphone ? "Громкая связь вкл." : "Громкая связь выкл."}
-                    >
-                        {speakerphone ? <MdOutlinePhonelinkRing /> : <MdOutlinePhoneInTalk />}
-                    </ControlButton>
+                    {isPhone && (
+                        <ControlButton
+                            onClick={() => {
+                                toggleSpeakerphone();
+                                unlockRemoteAudio();
+                            }}
+                            active={speakerphone}
+                            label={speakerphone ? "Громкая связь вкл." : "Громкая связь выкл."}
+                        >
+                            {speakerphone ? <MdOutlinePhonelinkRing /> : <MdOutlinePhoneInTalk />}
+                        </ControlButton>
+                    )}
 
                     <ControlButton
                         onClick={toggleFullscreen}
