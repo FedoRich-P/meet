@@ -19,4 +19,7 @@ export interface User {
     id: string;
     name: string;
     room: string;
+    joinedAt?: string;
+    leftAt?: string | null;
+    online?: boolean;
 }

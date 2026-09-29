@@ -14,7 +14,13 @@ export type PeerTileType = {
     connection: string;
 };
 
-type RoomUserType = { id: string; name: string; room: string };
+type RoomUserType = {
+    id: string;
+    name: string;
+    room: string;
+    online?: boolean;
+    leftAt?: string | null;
+};
 
 type UseMeetingRoomResult = {
     tiles: PeerTileType[];
@@ -202,68 +208,96 @@ export function useMeetingRoom(
 
     useEffect(() => {
         let stopped = false;
-        let raf = 0;
+        let timer = 0;
+        let lastEmittedSpeaking = false;
+        const remoteSpeaking = new Map<string, boolean>();
+
+        const resumeCtx = () => {
+            const ctx = analyseCtxRef.current;
+            if (ctx?.state === "suspended") void ctx.resume();
+        };
+        window.addEventListener("meet-unlock-audio", resumeCtx);
+        window.addEventListener("pointerdown", resumeCtx, { once: true });
+
+        const onRemoteSpeaking = ({ from, speaking }: { from: string; speaking: boolean }) => {
+            remoteSpeaking.set(from, speaking);
+        };
+        socket.on("speaking", onRemoteSpeaking);
+
+        const measureLocal = (): boolean => {
+            if (isMutedRef.current) return false;
+            const stream = localStreamRef.current;
+            if (!stream) return false;
+            const audioTracks = stream.getAudioTracks().filter((t) => t.enabled && t.readyState === "live");
+            if (audioTracks.length === 0) return false;
+            try {
+                if (!analyseCtxRef.current) {
+                    analyseCtxRef.current = new AudioContext();
+                }
+                const ctx = analyseCtxRef.current;
+                if (ctx.state === "suspended") void ctx.resume();
+                const trackId = audioTracks[0].id;
+                let holder = analyserHolders.get(stream);
+                if (!holder || holder.trackId !== trackId) {
+                    const source = ctx.createMediaStreamSource(new MediaStream([audioTracks[0]]));
+                    const analyser = ctx.createAnalyser();
+                    analyser.fftSize = 512;
+                    analyser.smoothingTimeConstant = 0.3;
+                    source.connect(analyser);
+                    holder = { source, analyser, trackId };
+                    analyserHolders.set(stream, holder);
+                }
+                const data = new Uint8Array(holder.analyser.fftSize);
+                holder.analyser.getByteTimeDomainData(data);
+                let sum = 0;
+                for (let i = 0; i < data.length; i += 1) {
+                    const v = (data[i] - 128) / 128;
+                    sum += v * v;
+                }
+                const rms = Math.sqrt(sum / data.length);
+                return rms > 0.04;
+            } catch {
+                return false;
+            }
+        };
 
         const tick = () => {
             if (stopped) return;
+            const localTalk = measureLocal();
+            setLocalSpeaking(localTalk);
+
+            if (localTalk !== lastEmittedSpeaking) {
+                lastEmittedSpeaking = localTalk;
+                socket.emit("speaking", { room: roomId, speaking: localTalk });
+            }
+
             const next = new Set<string>();
-            let localTalk = false;
-
-            const measure = (id: string, stream: MediaStream | null, isLocal: boolean) => {
-                if (!stream) return;
-                const audioTracks = stream.getAudioTracks().filter((t) => t.enabled && t.readyState === "live");
-                if (audioTracks.length === 0) return;
-                try {
-                    if (!analyseCtxRef.current) {
-                        analyseCtxRef.current = new AudioContext();
-                    }
-                    const ctx = analyseCtxRef.current;
-                    if (ctx.state === "suspended") void ctx.resume();
-                    const trackId = audioTracks[0].id;
-                    let holder = analyserHolders.get(stream);
-                    if (!holder || holder.trackId !== trackId) {
-                        const source = ctx.createMediaStreamSource(new MediaStream([audioTracks[0]]));
-                        const analyser = ctx.createAnalyser();
-                        analyser.fftSize = 256;
-                        analyser.smoothingTimeConstant = 0.5;
-                        source.connect(analyser);
-                        holder = { source, analyser, trackId };
-                        analyserHolders.set(stream, holder);
-                    }
-                    const data = new Uint8Array(holder.analyser.frequencyBinCount);
-                    holder.analyser.getByteFrequencyData(data);
-                    let sum = 0;
-                    for (let i = 0; i < data.length; i += 1) sum += data[i];
-                    const avg = sum / data.length;
-                    if (avg > 18) {
-                        next.add(id);
-                        if (isLocal) localTalk = true;
-                    }
-                } catch {
-                    // AudioContext / analyser unavailable
-                }
-            };
-
             const localId = localUserIdRef.current || "local";
-            if (!isMutedRef.current) measure(localId, localStreamRef.current, true);
-            for (const [id, stream] of remoteStreamsRef.current) {
-                measure(id, stream, false);
+            if (localTalk) next.add(localId);
+            for (const [id, speaking] of remoteSpeaking) {
+                if (speaking) next.add(id);
             }
 
             setSpeakingIds((prev) => {
                 if (prev.size === next.size && [...prev].every((id) => next.has(id))) return prev;
                 return next;
             });
-            setLocalSpeaking(localTalk);
-            raf = window.setTimeout(tick, 120);
+            timer = window.setTimeout(tick, 100);
         };
 
-        raf = window.setTimeout(tick, 120);
+        timer = window.setTimeout(tick, 100);
         return () => {
             stopped = true;
-            window.clearTimeout(raf);
+            window.clearTimeout(timer);
+            window.removeEventListener("meet-unlock-audio", resumeCtx);
+            window.removeEventListener("pointerdown", resumeCtx);
+            socket.off("speaking", onRemoteSpeaking);
+            if (lastEmittedSpeaking) {
+                socket.emit("speaking", { room: roomId, speaking: false });
+            }
         };
-    }, []);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [socket, roomId]);
 
     const publishTiles = useCallback(() => {
         const next: PeerTileType[] = [];
@@ -596,7 +630,7 @@ export function useMeetingRoom(
         };
 
         const onUsers = (users: RoomUserType[]) => {
-            void syncPeers(users);
+            void syncPeers(users.filter((u) => u.online !== false && !u.leftAt));
         };
 
         const onShare = ({ from, sharing }: { from: string; sharing: boolean }) => {
@@ -664,7 +698,12 @@ export function useMeetingRoom(
             }
             const nextMuted = !isMutedRef.current;
             applyMute(nextMuted);
-            if (!nextMuted) window.dispatchEvent(new CustomEvent("meet-unlock-audio"));
+            if (!nextMuted) {
+                window.dispatchEvent(new CustomEvent("meet-unlock-audio"));
+                void analyseCtxRef.current?.resume();
+            } else {
+                socket.emit("speaking", { room: roomId, speaking: false });
+            }
             setMediaError(null);
         } catch (err) {
             setMediaError(err instanceof Error ? err.message : "Микрофон недоступен");

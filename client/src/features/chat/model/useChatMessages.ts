@@ -4,7 +4,7 @@ import { userRoomSelector } from '../../../entities/user/userSlice';
 import { useAppDispatch, useAppSelector } from '../../../shared/hooks/hooks.ts'
 import { useSocket } from '../../../shared'
 import type { Message } from '../../../shared/types.ts'
-import { addMessage, removeMessage } from '../../../entities'
+import { addMessage } from '../../../entities'
 import { messagesSelector, mergePublicMessages } from '../../../entities/messages/messagesSlice.ts'
 import { chatApi } from '../../../shared/api/chatApi'
 
@@ -22,20 +22,25 @@ export function useChatMessages()  {
 
 	useEffect(() => {
 		if (fetchedMessages) {
-			dispatch(mergePublicMessages(fetchedMessages));
+			const withoutPresence = fetchedMessages.filter((msg) => {
+				const isSystem = msg.name === "Система" || msg.socketId === "system";
+				const isJoinOrLeave =
+					msg.text.includes("присоединился") || msg.text.includes("покинул");
+				return !(isSystem && isJoinOrLeave);
+			});
+			dispatch(mergePublicMessages(withoutPresence));
 		}
 	}, [fetchedMessages, dispatch]);
 
 	useEffect(() => {
 		const messageHandler = (data: Message) => {
+			const isSystem = data.name === "Система" || data.socketId === "system";
+			const isJoinOrLeave =
+				data.text.includes("присоединился") || data.text.includes("покинул");
+			// Presence belongs in participants list, not chat history
+			if (isSystem && isJoinOrLeave) return;
+
 			dispatch(addMessage(data));
-
-			const isSystem = data.name === 'Система';
-			const isJoinOrLeave = data.text.includes('присоединился') || data.text.includes('покинул');
-
-			if (isSystem && isJoinOrLeave) {
-				setTimeout(() => dispatch(removeMessage(data.id)), 5000);
-			}
 		};
 
 		const onCleared = ({ room: clearedRoom, message }: { room: string; message: Message }) => {

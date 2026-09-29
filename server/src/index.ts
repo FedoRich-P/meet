@@ -85,12 +85,38 @@ interface User {
     id: string;
     name: string;
     room: string;
+    joinedAt: string;
+    leftAt: string | null;
+    online: boolean;
 }
 
 /** Fallback when Mongo is not configured */
 const memoryMessages: Record<string, Message[]> = {};
+/** Online sockets only (for quick lookup) */
 const users = new Map<string, User>();
+/** Full roster per room, including who left */
+const roomRosters = new Map<string, Map<string, User>>();
 const sharingSockets = new Set<string>();
+
+function getRoster(room: string): Map<string, User> {
+    let roster = roomRosters.get(room);
+    if (!roster) {
+        roster = new Map();
+        roomRosters.set(room, roster);
+    }
+    return roster;
+}
+
+function listRoster(room: string): User[] {
+    return Array.from(getRoster(room).values()).sort((a, b) => {
+        if (a.online !== b.online) return a.online ? -1 : 1;
+        return a.joinedAt.localeCompare(b.joinedAt);
+    });
+}
+
+function isPresenceSystemText(text: string): boolean {
+    return text.includes("присоединился") || text.includes("покинул");
+}
 
 async function saveMessage(msg: Message): Promise<void> {
     if (isDbReady()) {
@@ -115,16 +141,20 @@ async function listMessages(roomId: string): Promise<Message[]> {
             roomId,
             $or: [{ toId: null }, { toId: "" }, { toId: { $exists: false } }],
         }).sort({ createdAt: 1 }).lean();
-        return rows.map((r) => ({
-            id: r.id,
-            name: r.name,
-            text: r.text,
-            socketId: r.socketId,
-            roomId: r.roomId,
-            attachment: r.attachment ?? null,
-        }));
+        return rows
+            .filter((r) => !(r.socketId === "system" && isPresenceSystemText(r.text)))
+            .map((r) => ({
+                id: r.id,
+                name: r.name,
+                text: r.text,
+                socketId: r.socketId,
+                roomId: r.roomId,
+                attachment: r.attachment ?? null,
+            }));
     }
-    return (memoryMessages[roomId] || []).filter((msg) => !msg.toId);
+    return (memoryMessages[roomId] || []).filter(
+        (msg) => !msg.toId && !(msg.socketId === "system" && isPresenceSystemText(msg.text))
+    );
 }
 
 async function touchMeeting(
@@ -158,8 +188,8 @@ const aloneTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
 function countInRoom(room: string): number {
     let count = 0;
-    for (const user of users.values()) {
-        if (user.room === room) count += 1;
+    for (const user of getRoster(room).values()) {
+        if (user.online) count += 1;
     }
     return count;
 }
@@ -170,6 +200,7 @@ function endMeeting(room: string, reason: string): void {
     for (const [id, user] of users) {
         if (user.room === room) users.delete(id);
     }
+    roomRosters.delete(room);
     meetingMeta.delete(room);
 }
 
@@ -312,9 +343,47 @@ app.get("/api/messages", async (req: Request, res: Response) => {
 
 io.on("connection", (socket: Socket) => {
     function emitUsers(room: string) {
-        const roomUsers = Array.from(users.values()).filter((u) => u.room === room);
-        io.to(room).emit("users", roomUsers);
+        io.to(room).emit("users", listRoster(room));
         scheduleAloneEnd(room);
+    }
+
+    function markMemberLeft(socketId: string): User | null {
+        const user = users.get(socketId);
+        if (!user) return null;
+        const leftAt = new Date().toISOString();
+        const roster = getRoster(user.room);
+        const member = roster.get(socketId);
+        if (member) {
+            member.online = false;
+            member.leftAt = leftAt;
+            roster.set(socketId, member);
+        }
+        users.delete(socketId);
+        sharingSockets.delete(socketId);
+        return { ...user, online: false, leftAt };
+    }
+
+    function upsertMember(socketId: string, name: string, room: string): User {
+        const roster = getRoster(room);
+        const now = new Date().toISOString();
+
+        for (const [id, member] of [...roster.entries()]) {
+            if (!member.online && member.name === name) {
+                roster.delete(id);
+            }
+        }
+
+        const member: User = {
+            id: socketId,
+            name,
+            room,
+            joinedAt: now,
+            leftAt: null,
+            online: true,
+        };
+        roster.set(socketId, member);
+        users.set(socketId, member);
+        return member;
     }
 
     socket.on(
@@ -331,7 +400,7 @@ io.on("connection", (socket: Socket) => {
             isOrganizer?: boolean;
         }) => {
             try {
-                users.set(socket.id, { id: socket.id, name, room });
+                upsertMember(socket.id, name, room);
                 socket.join(room);
 
                 let meta = meetingMeta.get(room);
@@ -363,16 +432,6 @@ io.on("connection", (socket: Socket) => {
                     organizerSocketId: meta.organizerSocketId,
                 });
 
-                const joinMsg: Message = {
-                    id: `join-${socket.id}-${Date.now()}`,
-                    name: "Система",
-                    text: `${name} присоединился к комнате`,
-                    socketId: "system",
-                    roomId: room,
-                };
-
-                await saveMessage(joinMsg);
-                io.to(room).emit("message", joinMsg);
                 emitUsers(room);
                 for (const id of sharingSockets) {
                     const sharer = users.get(id);
@@ -432,6 +491,12 @@ io.on("connection", (socket: Socket) => {
         void saveMessage(msg).then(() => io.to(room).emit("message", msg));
     });
 
+    socket.on("speaking", ({ room, speaking }: { room: string; speaking: boolean }) => {
+        const user = users.get(socket.id);
+        if (!user || user.room !== room) return;
+        socket.to(room).emit("speaking", { from: socket.id, speaking: Boolean(speaking) });
+    });
+
     socket.on("sendMessage", async (msg: Message) => {
         try {
             if (!msg?.roomId || !msg?.text?.trim()) return;
@@ -481,62 +546,24 @@ io.on("connection", (socket: Socket) => {
         }
     });
 
-    socket.on("leaveChat", async (data?: { name?: string }) => {
-        const user = users.get(socket.id);
-        const userName = user?.name || data?.name;
+    socket.on("leaveChat", () => {
+        const user = markMemberLeft(socket.id);
         if (!user) return;
-
-        users.delete(socket.id);
-        sharingSockets.delete(socket.id);
         socket.to(user.room).emit("shareState", { from: socket.id, sharing: false });
         socket.leave(user.room);
         emitUsers(user.room);
-
-        const leaveMsg: Message = {
-            id: `leave-${socket.id}-${Date.now()}`,
-            name: "Система",
-            text: `${userName} покинул комнату`,
-            socketId: "system",
-            roomId: user.room,
-        };
-
-        try {
-            await saveMessage(leaveMsg);
-            io.to(user.room).emit("message", leaveMsg);
-        } catch (err) {
-            console.error("leaveChat error", err);
-        }
     });
 
-    socket.on("disconnect", async () => {
-        const user = users.get(socket.id);
+    socket.on("disconnect", () => {
+        const user = markMemberLeft(socket.id);
         if (!user) return;
-
-        users.delete(socket.id);
-        sharingSockets.delete(socket.id);
         socket.to(user.room).emit("shareState", { from: socket.id, sharing: false });
         socket.leave(user.room);
-
-        const leaveMsg: Message = {
-            id: `leave-${socket.id}-${Date.now()}`,
-            name: "Система",
-            text: `${user.name} покинул комнату`,
-            socketId: "system",
-            roomId: user.room,
-        };
-
-        try {
-            await saveMessage(leaveMsg);
-            io.to(user.room).emit("message", leaveMsg);
-            emitUsers(user.room);
-        } catch (err) {
-            console.error("disconnect error", err);
-        }
+        emitUsers(user.room);
     });
 
     socket.on("getUsers", (room: string) => {
-        const roomUsers = Array.from(users.values()).filter((u) => u.room === room);
-        socket.emit("users", roomUsers);
+        socket.emit("users", listRoster(room));
     });
 
     socket.on("callUser", ({ userToCall, signal, from, name }) => {

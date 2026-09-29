@@ -1,6 +1,8 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
 import {
     FaCheck,
+    FaChevronLeft,
+    FaChevronRight,
     FaComments,
     FaCopy,
     FaTimes,
@@ -30,6 +32,22 @@ type MeetingInfoType = {
     organizerSocketId: string;
 };
 
+const SIDEBAR_WIDTH_KEY = "meet_sidebar_width";
+const SIDEBAR_DEFAULT = 400;
+const SIDEBAR_MIN = 280;
+const SIDEBAR_MAX = 640;
+
+function loadSidebarWidth(): number {
+    try {
+        const raw = localStorage.getItem(SIDEBAR_WIDTH_KEY);
+        const n = raw ? Number(raw) : SIDEBAR_DEFAULT;
+        if (!Number.isFinite(n)) return SIDEBAR_DEFAULT;
+        return Math.min(SIDEBAR_MAX, Math.max(SIDEBAR_MIN, n));
+    } catch {
+        return SIDEBAR_DEFAULT;
+    }
+}
+
 export function MeetingShell({ meetingId, onLeave }: MeetingShellProps) {
     const socket = useSocket();
     const userName = useSelector((state: RootState) => state.user.name);
@@ -52,8 +70,11 @@ export function MeetingShell({ meetingId, onLeave }: MeetingShellProps) {
     const [unread, setUnread] = useState(0);
     const [dmPeer, setDmPeer] = useState<{ id: string; name: string } | null>(null);
     const [aloneSeconds, setAloneSeconds] = useState<number | null>(null);
+    const [sidebarWidth, setSidebarWidth] = useState(loadSidebarWidth);
+    const resizingRef = useRef(false);
 
     const shareUrl = getMeetingShareUrl(meetingId);
+    const sidePanelOpen = chatOpen || peopleOpen;
     const chatVisible = chatOpen;
     const peopleVisible = peopleOpen;
     const isOrganizer = Boolean(organizerSocketId) && localSocketId === organizerSocketId;
@@ -192,6 +213,45 @@ export function MeetingShell({ meetingId, onLeave }: MeetingShellProps) {
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [aloneSeconds == null]);
 
+    const onResizePointerMove = useCallback((event: PointerEvent) => {
+        if (!resizingRef.current) return;
+        const next = Math.min(SIDEBAR_MAX, Math.max(SIDEBAR_MIN, window.innerWidth - event.clientX));
+        setSidebarWidth(next);
+    }, []);
+
+    const stopResize = useCallback(() => {
+        if (!resizingRef.current) return;
+        resizingRef.current = false;
+        document.body.style.cursor = "";
+        document.body.style.userSelect = "";
+        setSidebarWidth((w) => {
+            try {
+                localStorage.setItem(SIDEBAR_WIDTH_KEY, String(w));
+            } catch {
+                // ignore
+            }
+            return w;
+        });
+        window.removeEventListener("pointermove", onResizePointerMove);
+        window.removeEventListener("pointerup", stopResize);
+    }, [onResizePointerMove]);
+
+    function startResize(event: ReactPointerEvent) {
+        event.preventDefault();
+        resizingRef.current = true;
+        document.body.style.cursor = "col-resize";
+        document.body.style.userSelect = "none";
+        window.addEventListener("pointermove", onResizePointerMove);
+        window.addEventListener("pointerup", stopResize);
+    }
+
+    useEffect(() => {
+        return () => {
+            window.removeEventListener("pointermove", onResizePointerMove);
+            window.removeEventListener("pointerup", stopResize);
+        };
+    }, [onResizePointerMove, stopResize]);
+
     async function copyLink() {
         try {
             await navigator.clipboard.writeText(shareUrl);
@@ -240,7 +300,7 @@ export function MeetingShell({ meetingId, onLeave }: MeetingShellProps) {
         </div>
     );
 
-    const subtitle = organizerName ? `(орг. ${organizerName})` : null;
+    const subtitle = organizerName ? `(организатор ${organizerName})` : null;
 
     return (
         <div className="flex h-dvh flex-col overflow-hidden bg-tg-bg text-tg-text">
@@ -303,46 +363,62 @@ export function MeetingShell({ meetingId, onLeave }: MeetingShellProps) {
                 </section>
 
                 <aside
-                    className={`min-h-0 shrink-0 flex-col border-l border-tg-border bg-tg-surface ${
-                        peopleVisible ? "flex w-full md:w-72" : "hidden"
+                    className={`relative min-h-0 shrink-0 flex-col border-l border-tg-border bg-tg-surface ${
+                        sidePanelOpen ? "flex w-full md:[width:var(--sidebar-width)]" : "hidden"
                     }`}
+                    style={{ ["--sidebar-width" as string]: `${sidebarWidth}px` }}
+                    aria-hidden={!sidePanelOpen}
                 >
-                    <PanelHeader
-                        title="Участники"
-                        onClose={() => {
-                            setPeopleOpen(false);
-                            if (mobileTab === "people") setMobileTab("call");
-                        }}
-                        className="hidden md:flex"
-                    />
-                    <div className="min-h-0 flex-1">
-                        <ParticipantsPanel onOpenChat={openDirectChat} hideHeader />
+                    <div
+                        role="separator"
+                        aria-orientation="vertical"
+                        aria-label="Изменить ширину панели"
+                        onPointerDown={startResize}
+                        className="group absolute inset-y-0 left-0 z-20 hidden w-3 -translate-x-1/2 cursor-col-resize items-center justify-center md:flex"
+                    >
+                        <span className="flex h-10 items-center gap-0.5 rounded-full bg-tg-surface-2 px-0.5 text-[9px] text-tg-text-muted opacity-35 transition group-hover:bg-tg-panel group-hover:text-tg-accent group-hover:opacity-100 group-active:opacity-100">
+                            <FaChevronLeft className="h-2.5 w-2.5" />
+                            <FaChevronRight className="h-2.5 w-2.5" />
+                        </span>
                     </div>
-                </aside>
 
-                {/* Always mounted so unread/chat subscription survives close */}
-                <aside
-                    className={`min-h-0 shrink-0 flex-col border-l border-tg-border bg-tg-surface ${
-                        chatVisible ? "flex w-full md:w-[520px]" : "hidden"
-                    }`}
-                    aria-hidden={!chatVisible}
-                >
-                    <PanelHeader
-                        title="Чат встречи"
-                        onClose={() => {
-                            setChatOpen(false);
-                            if (mobileTab === "chat") setMobileTab("call");
-                        }}
-                        className="hidden md:flex"
-                    />
-                    <div className="min-h-0 flex-1">
-                        <ChatMessageBlock
-                            meetingId={meetingId}
-                            canClear={isOrganizer && !dmPeer}
-                            peer={dmPeer}
-                            onClosePeer={() => setDmPeer(null)}
-                            onSelectPeer={openDirectChat}
+                    {peopleVisible ? (
+                        <>
+                            <PanelHeader
+                                title="Участники"
+                                onClose={() => {
+                                    setPeopleOpen(false);
+                                    if (mobileTab === "people") setMobileTab("call");
+                                }}
+                                className="hidden md:flex"
+                            />
+                            <div className="min-h-0 flex-1">
+                                <ParticipantsPanel onOpenChat={openDirectChat} hideHeader />
+                            </div>
+                        </>
+                    ) : null}
+
+                    <div
+                        className={`min-h-0 flex-1 flex-col ${chatVisible ? "flex" : "hidden"}`}
+                        aria-hidden={!chatVisible}
+                    >
+                        <PanelHeader
+                            title="Чат встречи"
+                            onClose={() => {
+                                setChatOpen(false);
+                                if (mobileTab === "chat") setMobileTab("call");
+                            }}
+                            className="hidden md:flex"
                         />
+                        <div className="min-h-0 flex-1">
+                            <ChatMessageBlock
+                                meetingId={meetingId}
+                                canClear={isOrganizer && !dmPeer}
+                                peer={dmPeer}
+                                onClosePeer={() => setDmPeer(null)}
+                                onSelectPeer={openDirectChat}
+                            />
+                        </div>
                     </div>
                 </aside>
             </div>
