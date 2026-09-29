@@ -223,6 +223,7 @@ export function MeetingShell({ meetingId, onLeave }: MeetingShellProps) {
         if (!resizingRef.current) return;
         resizingRef.current = false;
         document.body.style.cursor = "";
+        document.documentElement.style.cursor = "";
         document.body.style.userSelect = "";
         setSidebarWidth((w) => {
             try {
@@ -239,7 +240,8 @@ export function MeetingShell({ meetingId, onLeave }: MeetingShellProps) {
     function startResize(event: ReactPointerEvent) {
         event.preventDefault();
         resizingRef.current = true;
-        document.body.style.cursor = "col-resize";
+        document.body.style.cursor = "pointer";
+        document.documentElement.style.cursor = "pointer";
         document.body.style.userSelect = "none";
         window.addEventListener("pointermove", onResizePointerMove);
         window.addEventListener("pointerup", stopResize);
@@ -541,7 +543,7 @@ function HeaderToggle({
             title={label}
             aria-label={label}
             aria-pressed={active}
-            className={`inline-flex items-center justify-center rounded-xl p-2.5 leading-none transition [&_svg]:block [&_svg]:h-4 [&_svg]:w-4 ${className} ${
+            className={`inline-flex cursor-pointer items-center justify-center rounded-xl p-2.5 leading-none transition hover:brightness-110 active:scale-95 [&_svg]:block [&_svg]:h-4 [&_svg]:w-4 ${className} ${
                 active ? "bg-tg-accent text-white" : "bg-tg-surface-2 text-tg-text hover:bg-tg-panel"
             }`}
         >

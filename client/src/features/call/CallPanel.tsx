@@ -90,7 +90,50 @@ export function CallPanel({
         tiles.find((t) => !t.isLocal) ??
         tiles[0];
 
-    const stripTiles = tiles.filter((t) => t.id !== stageTile?.id);
+    // Everyone except current stage — alternate right / left columns (start from right)
+    const sideTiles = tiles.filter((t) => t.id !== stageTile?.id);
+    const rightTiles = sideTiles.filter((_, i) => i % 2 === 0);
+    const leftTiles = sideTiles.filter((_, i) => i % 2 === 1);
+
+    function ThumbColumn({
+        tiles: columnTiles,
+        side,
+    }: {
+        tiles: PeerTileType[];
+        side: "left" | "right";
+    }) {
+        if (columnTiles.length === 0) return null;
+        return (
+            <div
+                className={`absolute bottom-24 z-20 flex max-h-[55%] flex-col-reverse gap-2 overflow-y-auto ${
+                    side === "right" ? "right-3 items-end" : "left-3 items-start"
+                }`}
+            >
+                {columnTiles.map((tile) => (
+                    <button
+                        key={tile.id}
+                        type="button"
+                        onClick={() => setStagePeerId(tile.id)}
+                        className={`relative h-20 w-32 shrink-0 cursor-pointer overflow-hidden rounded-xl ring-2 transition hover:ring-tg-accent active:scale-[0.98] ${
+                            speakingIds.has(tile.id)
+                                ? "animate-pulse ring-tg-online"
+                                : "ring-white/20"
+                        }`}
+                    >
+                        <TileVideo tile={tile} variant="thumb" speaking={speakingIds.has(tile.id)} />
+                        <span className="absolute inset-x-0 bottom-0 truncate bg-black/60 px-1 py-0.5 text-[10px] text-white">
+                            {tile.name}
+                        </span>
+                    </button>
+                ))}
+                {side === "right" && (
+                    <p className="max-w-32 px-1 text-right text-[11px] text-white/90">
+                        Нажмите, чтобы увеличить
+                    </p>
+                )}
+            </div>
+        );
+    }
 
     return (
         <div id="meet-stage" className="relative h-full w-full overflow-hidden bg-black">
@@ -162,34 +205,8 @@ export function CallPanel({
                 )}
             </div>
 
-            {stripTiles.length > 0 && (
-                <div className="absolute bottom-24 right-3 z-20 flex max-w-[70%] flex-col items-end gap-1">
-                    <div className="flex gap-2 overflow-x-auto">
-                        {stripTiles.map((tile) => (
-                            <button
-                                key={tile.id}
-                                type="button"
-                                onClick={() => setStagePeerId(tile.id)}
-                                className={`relative h-20 w-32 shrink-0 overflow-hidden rounded-xl ring-2 transition hover:ring-tg-accent ${
-                                    speakingIds.has(tile.id)
-                                        ? "animate-pulse ring-tg-online"
-                                        : "ring-white/20"
-                                }`}
-                            >
-                                <TileVideo
-                                    tile={tile}
-                                    variant="thumb"
-                                    speaking={speakingIds.has(tile.id)}
-                                />
-                                <span className="absolute inset-x-0 bottom-0 truncate bg-black/60 px-1 py-0.5 text-[10px] text-white">
-                                    {tile.name}
-                                </span>
-                            </button>
-                        ))}
-                    </div>
-                    <p className="px-1 text-[11px] text-white/90">Нажмите, чтобы увеличить</p>
-                </div>
-            )}
+            <ThumbColumn tiles={rightTiles} side="right" />
+            <ThumbColumn tiles={leftTiles} side="left" />
 
             {mediaError && (
                 <div className="absolute left-3 right-3 top-12 z-20 rounded-xl bg-tg-danger/90 px-3 py-2 text-center text-xs text-white">
@@ -203,6 +220,7 @@ export function CallPanel({
                         onClick={() => void toggleMute()}
                         danger={isMuted}
                         speaking={!isMuted && localSpeaking}
+                        active={!isMuted && !localSpeaking}
                         label={isMuted ? "Микрофон выкл." : "Микрофон"}
                     >
                         {isMuted ? <FaMicrophoneSlash /> : <FaMicrophone />}
@@ -211,6 +229,7 @@ export function CallPanel({
                     <ControlButton
                         onClick={() => void toggleCam()}
                         danger={isCamOff && !isSharing}
+                        active={!isCamOff && !isSharing}
                         label={isCamOff ? "Камера выкл." : "Камера"}
                     >
                         {isCamOff ? <FaVideoSlash /> : <FaVideo />}
@@ -219,6 +238,7 @@ export function CallPanel({
                     <ControlButton
                         onClick={() => void toggleScreenShare()}
                         danger={isSharing}
+                        active={isSharing}
                         label={isSharing ? "Стоп экран" : "Демонстрация экрана"}
                     >
                         <FaDesktop />
@@ -458,14 +478,14 @@ function ControlButton({
             aria-label={label}
             disabled={disabled}
             onClick={onClick}
-            className={`inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-full p-0 leading-none transition disabled:opacity-40 sm:h-12 sm:w-12 [&_svg]:block [&_svg]:h-[18px] [&_svg]:w-[18px] ${
+            className={`inline-flex h-11 w-11 shrink-0 cursor-pointer items-center justify-center rounded-full p-0 leading-none transition enabled:hover:brightness-125 enabled:active:scale-95 disabled:cursor-not-allowed disabled:opacity-40 sm:h-12 sm:w-12 [&_svg]:block [&_svg]:h-[18px] [&_svg]:w-[18px] ${
                 danger
-                    ? "bg-tg-danger text-white hover:bg-tg-danger-hover"
+                    ? "bg-tg-danger text-white enabled:hover:bg-tg-danger-hover"
                     : speaking
                       ? "animate-pulse bg-tg-online text-white ring-2 ring-tg-online/80"
                       : active
-                        ? "bg-tg-surface-2 text-tg-text ring-2 ring-tg-accent hover:bg-tg-panel"
-                        : "bg-tg-surface-2 text-tg-text hover:bg-tg-panel"
+                        ? "bg-tg-accent text-white ring-2 ring-tg-accent/80 enabled:hover:bg-tg-accent-hover"
+                        : "bg-tg-surface-2 text-tg-text enabled:hover:bg-tg-panel"
             }`}
         >
             {children}
