@@ -179,25 +179,57 @@ function clearAloneTimer(room: string): void {
     aloneTimers.delete(room);
 }
 
-function scheduleAloneEnd(room: string, delayMs = 60_000, warn = true): void {
+const ALONE_IDLE_MS = 5 * 60_000;
+const ALONE_WARN_MS = 60_000;
+
+function scheduleAloneEnd(room: string): void {
     clearAloneTimer(room);
     if (countInRoom(room) !== 1) {
         io.to(room).emit("aloneCleared", { room });
         return;
     }
-    if (warn) {
-        io.to(room).emit("aloneWarning", {
-            room,
-            secondsLeft: Math.round(delayMs / 1000),
-        });
-    }
-    const timer = setTimeout(() => {
-        aloneTimers.delete(room);
-        if (countInRoom(room) === 1) {
-            endMeeting(room, "Встреча завершена: остался один участник");
+    // 5 minutes alone with no popup, then warn for 1 minute, then end
+    const idleTimer = setTimeout(() => {
+        if (countInRoom(room) !== 1) {
+            aloneTimers.delete(room);
+            io.to(room).emit("aloneCleared", { room });
+            return;
         }
-    }, delayMs);
-    aloneTimers.set(room, timer);
+        io.to(room).emit("aloneWarning", { room, secondsLeft: Math.round(ALONE_WARN_MS / 1000) });
+        const endTimer = setTimeout(() => {
+            aloneTimers.delete(room);
+            if (countInRoom(room) === 1) {
+                endMeeting(room, "Встреча завершена: остался один участник");
+            }
+        }, ALONE_WARN_MS);
+        aloneTimers.set(room, endTimer);
+    }, ALONE_IDLE_MS);
+    aloneTimers.set(room, idleTimer);
+}
+
+function extendAloneByFiveMinutes(room: string): void {
+    clearAloneTimer(room);
+    if (countInRoom(room) !== 1) {
+        io.to(room).emit("aloneCleared", { room });
+        return;
+    }
+    io.to(room).emit("aloneCleared", { room });
+    const idleTimer = setTimeout(() => {
+        if (countInRoom(room) !== 1) {
+            aloneTimers.delete(room);
+            io.to(room).emit("aloneCleared", { room });
+            return;
+        }
+        io.to(room).emit("aloneWarning", { room, secondsLeft: Math.round(ALONE_WARN_MS / 1000) });
+        const endTimer = setTimeout(() => {
+            aloneTimers.delete(room);
+            if (countInRoom(room) === 1) {
+                endMeeting(room, "Встреча завершена: остался один участник");
+            }
+        }, ALONE_WARN_MS);
+        aloneTimers.set(room, endTimer);
+    }, ALONE_IDLE_MS);
+    aloneTimers.set(room, idleTimer);
 }
 
 app.get("/api/meetings/:meetingId", async (req: Request, res: Response) => {
@@ -376,8 +408,7 @@ io.on("connection", (socket: Socket) => {
         const user = users.get(socket.id);
         if (!user || user.room !== room) return;
         if (countInRoom(room) !== 1) return;
-        scheduleAloneEnd(room, 5 * 60_000, true);
-        socket.emit("aloneExtended", { room, secondsLeft: 300 });
+        extendAloneByFiveMinutes(room);
     });
 
     socket.on("closeAloneRoom", ({ room }: { room: string }) => {

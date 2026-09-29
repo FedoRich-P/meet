@@ -167,20 +167,14 @@ export function MeetingShell({ meetingId, onLeave }: MeetingShellProps) {
             if (room !== meetingId) return;
             setAloneSeconds(secondsLeft);
         };
-        const onExtended = ({ room, secondsLeft }: { room: string; secondsLeft: number }) => {
-            if (room !== meetingId) return;
-            setAloneSeconds(secondsLeft);
-        };
         const onCleared = ({ room }: { room: string }) => {
             if (room !== meetingId) return;
             setAloneSeconds(null);
         };
         socket.on("aloneWarning", onWarn);
-        socket.on("aloneExtended", onExtended);
         socket.on("aloneCleared", onCleared);
         return () => {
             socket.off("aloneWarning", onWarn);
-            socket.off("aloneExtended", onExtended);
             socket.off("aloneCleared", onCleared);
         };
     }, [socket, meetingId]);
@@ -221,6 +215,7 @@ export function MeetingShell({ meetingId, onLeave }: MeetingShellProps) {
     }
 
     function extendAlone() {
+        setAloneSeconds(null);
         socket.emit("extendAlone", { room: meetingId });
     }
 
@@ -392,7 +387,7 @@ export function MeetingShell({ meetingId, onLeave }: MeetingShellProps) {
                     >
                         <h2 className="text-lg font-semibold text-tg-text">Вы остались одни</h2>
                         <p className="mt-2 text-sm leading-relaxed text-tg-text-muted">
-                            Во встрече один участник. Встреча закроется через{" "}
+                            Уже 5 минут во встрече один участник. Встреча закроется через{" "}
                             <span className="font-semibold text-tg-warning">
                                 {Math.floor(aloneSeconds / 60)}:
                                 {String(aloneSeconds % 60).padStart(2, "0")}

@@ -105,7 +105,7 @@ export function Home() {
                     <form onSubmit={handleCreate} className="flex flex-col gap-3">
                         <label className="block">
                             <span className="mb-1.5 block text-xs font-medium uppercase tracking-wide text-tg-text-muted">
-                                Название встречи
+                                Название встречи (обязательно)
                             </span>
                             <input
                                 value={meetingTitleInput}
@@ -114,9 +114,6 @@ export function Home() {
                                 required
                                 className="w-full rounded-xl border border-tg-surface-2 bg-tg-bg px-4 py-3 text-tg-text outline-none transition placeholder:text-tg-text-muted focus:border-tg-accent"
                             />
-                            <span className="mt-1.5 block text-[11px] text-tg-text-muted">
-                                Попадёт в ссылку: /m/stendap-komandy-…
-                            </span>
                         </label>
                         <button
                             type="submit"
