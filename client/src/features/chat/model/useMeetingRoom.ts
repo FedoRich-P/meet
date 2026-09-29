@@ -10,6 +10,7 @@ export type PeerTileType = {
     audioEnabled: boolean;
     videoEnabled: boolean;
     videoTrackId: string;
+    audioTrackId: string;
     connection: string;
 };
 
@@ -195,6 +196,7 @@ export function useMeetingRoom(
             audioEnabled: Boolean(local?.getAudioTracks().some((t) => t.enabled)),
             videoEnabled: Boolean(local?.getVideoTracks().some((t) => t.enabled && t.readyState === "live")),
             videoTrackId: local?.getVideoTracks()[0]?.id ?? "",
+            audioTrackId: local?.getAudioTracks()[0]?.id ?? "",
             connection: "local",
         });
 
@@ -212,6 +214,7 @@ export function useMeetingRoom(
                     ? videoTracks.some((t) => t.readyState === "live")
                     : videoTracks.some((t) => t.enabled && t.readyState === "live"),
                 videoTrackId: videoTracks[0]?.id ?? "",
+                audioTrackId: stream.getAudioTracks()[0]?.id ?? "",
                 connection: connectionLabel(peerConnRef.current.get(id) || "new"),
             });
         }
@@ -328,7 +331,10 @@ export function useMeetingRoom(
                 track.enabled = true;
                 track.onunmute = () => publishTiles();
                 track.onmute = () => publishTiles();
-                track.onended = () => publishTiles();
+                track.onended = () => {
+                    if (stream.getTrackById(track.id)) stream.removeTrack(track);
+                    publishTiles();
+                };
                 if (
                     track.kind === "video" &&
                     (peerSharingRef.current.has(remoteId) || trackLooksLikeScreen(track))
@@ -499,9 +505,19 @@ export function useMeetingRoom(
 
         const onShare = ({ from, sharing }: { from: string; sharing: boolean }) => {
             if (sharing) peerSharingRef.current.add(from);
-            else peerSharingRef.current.delete(from);
+            else {
+                peerSharingRef.current.delete(from);
+                setStagePeerId((prev) => (prev === from ? null : prev));
+                const remote = remoteStreamsRef.current.get(from);
+                if (remote) {
+                    for (const vt of [...remote.getVideoTracks()]) {
+                        remote.removeTrack(vt);
+                    }
+                }
+            }
             if (sharing) setStagePeerId(from);
             publishTiles();
+            if (!sharing) window.dispatchEvent(new CustomEvent("meet-unlock-audio"));
         };
 
         socket.on("incomingCall", onIncoming);
@@ -550,7 +566,9 @@ export function useMeetingRoom(
                 setMediaError("Микрофон не найден");
                 return;
             }
-            applyMute(!isMutedRef.current);
+            const nextMuted = !isMutedRef.current;
+            applyMute(nextMuted);
+            if (!nextMuted) window.dispatchEvent(new CustomEvent("meet-unlock-audio"));
             setMediaError(null);
         } catch (err) {
             setMediaError(err instanceof Error ? err.message : "Микрофон недоступен");

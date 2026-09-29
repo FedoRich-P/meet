@@ -1,4 +1,4 @@
-import { useEffect, useRef, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import {
     FaCompress,
     FaDesktop,
@@ -50,10 +50,23 @@ export function CallPanel({
         toggleRemoteSound,
     } = useMeetingRoom(localUserId, localUserName, roomId);
 
+    const [needsAudioTap, setNeedsAudioTap] = useState(false);
+
     useEffect(() => {
         void enableMedia().catch(() => undefined);
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
+
+    useEffect(() => {
+        const onNeedTap = () => setNeedsAudioTap(true);
+        window.addEventListener("meet-audio-blocked", onNeedTap);
+        return () => window.removeEventListener("meet-audio-blocked", onNeedTap);
+    }, []);
+
+    function unlockRemoteAudio() {
+        setNeedsAudioTap(false);
+        window.dispatchEvent(new CustomEvent("meet-unlock-audio"));
+    }
 
     const stageTile =
         tiles.find((t) => t.id === stagePeerId) ??
@@ -70,7 +83,14 @@ export function CallPanel({
                 {connectionHint}
             </div>
 
-            <div className="absolute inset-0">
+            <div
+                className="absolute inset-0"
+                onClick={() => {
+                    if (needsAudioTap) unlockRemoteAudio();
+                }}
+                onKeyDown={() => undefined}
+                role="presentation"
+            >
                 {stageTile ? (
                     <TileVideo tile={stageTile} variant="stage" soundOff={remoteSoundOff} />
                 ) : (
@@ -104,6 +124,19 @@ export function CallPanel({
                             : ""}
                     </div>
                 )}
+
+                {needsAudioTap && stageTile && !stageTile.isLocal && (
+                    <button
+                        type="button"
+                        onClick={(e) => {
+                            e.stopPropagation();
+                            unlockRemoteAudio();
+                        }}
+                        className="absolute left-1/2 top-1/2 z-30 max-w-[85%] -translate-x-1/2 -translate-y-1/2 rounded-xl bg-black/85 px-4 py-3 text-center text-sm text-white ring-2 ring-tg-online"
+                    >
+                        Нажмите, чтобы включить звук собеседника
+                    </button>
+                )}
             </div>
 
             {stripTiles.length > 0 && (
@@ -114,7 +147,9 @@ export function CallPanel({
                             key={tile.id}
                             type="button"
                             onClick={() => setStagePeerId(tile.id)}
-                            className="relative h-20 w-32 shrink-0 overflow-hidden rounded-xl ring-2 ring-white/20 transition hover:ring-tg-accent"
+                            className={`relative h-20 w-32 shrink-0 overflow-hidden rounded-xl ring-2 transition hover:ring-tg-accent ${
+                                tile.audioEnabled ? "ring-tg-online" : "ring-white/20"
+                            }`}
                         >
                             <TileVideo tile={tile} variant="thumb" soundOff={remoteSoundOff} />
                             <span className="absolute inset-x-0 bottom-0 truncate bg-black/60 px-1 py-0.5 text-[10px] text-white">
@@ -138,6 +173,7 @@ export function CallPanel({
                     <ControlButton
                         onClick={() => void toggleMute()}
                         danger={isMuted}
+                        active={!isMuted}
                         label={isMuted ? "Микрофон выкл." : "Микрофон"}
                     >
                         {isMuted ? <FaMicrophoneSlash /> : <FaMicrophone />}
@@ -205,53 +241,77 @@ function TileVideo({
     soundOff: boolean;
 }) {
     const videoRef = useRef<HTMLVideoElement | null>(null);
+    const audioRef = useRef<HTMLAudioElement | null>(null);
+    const playRemoteAudio = !tile.isLocal && variant === "stage";
 
     useEffect(() => {
         const video = videoRef.current;
+        const audio = audioRef.current;
         const stream = tile.stream;
-        if (!video || !stream) return;
+        if (!stream) return;
 
-        const attach = () => {
+        const attachVideo = () => {
+            if (!video) return;
             video.srcObject = stream;
-            const muted = tile.isLocal || soundOff;
-            video.muted = muted;
-            video.defaultMuted = tile.isLocal;
-            video.volume = muted ? 0 : 1;
+            video.muted = true;
+            video.defaultMuted = true;
             video.playsInline = true;
             void video.play().catch(() => undefined);
         };
 
-        attach();
-        stream.addEventListener("addtrack", attach);
-        stream.addEventListener("removetrack", attach);
+        const attachAudio = () => {
+            if (!playRemoteAudio || !audio) return;
+            audio.srcObject = stream;
+            audio.muted = soundOff;
+            audio.volume = soundOff ? 0 : 1;
+            void audio.play().catch(() => {
+                window.dispatchEvent(new CustomEvent("meet-audio-blocked"));
+            });
+        };
+
+        const syncTracks = () => {
+            attachVideo();
+            attachAudio();
+        };
+
+        syncTracks();
+        stream.addEventListener("addtrack", syncTracks);
+        stream.addEventListener("removetrack", syncTracks);
 
         const onUnlock = () => {
-            video.muted = tile.isLocal || soundOff;
-            video.volume = tile.isLocal || soundOff ? 0 : 1;
-            void video.play().catch(() => undefined);
+            attachAudio();
         };
         window.addEventListener("meet-unlock-audio", onUnlock);
         return () => {
-            stream.removeEventListener("addtrack", attach);
-            stream.removeEventListener("removetrack", attach);
+            stream.removeEventListener("addtrack", syncTracks);
+            stream.removeEventListener("removetrack", syncTracks);
             window.removeEventListener("meet-unlock-audio", onUnlock);
         };
-    }, [tile.stream, tile.isLocal, tile.videoTrackId, soundOff]);
+    }, [tile.stream, tile.isLocal, tile.videoTrackId, tile.audioTrackId, soundOff, playRemoteAudio]);
 
     const waitingShare = tile.isSharing && !tile.videoEnabled;
     const showAvatar = (!tile.videoEnabled || !tile.stream) && !tile.isSharing;
 
+    const activeRing = tile.audioEnabled && (tile.isLocal || variant === "stage");
+
     return (
-        <div className="relative h-full w-full bg-black">
+        <div
+            className={`relative h-full w-full bg-black ${
+                activeRing ? "ring-2 ring-inset ring-tg-online" : ""
+            }`}
+        >
             <video
                 ref={videoRef}
                 autoPlay
                 playsInline
-                muted={tile.isLocal || soundOff}
+                muted
                 className={`h-full w-full bg-black ${videoFitClass(tile, variant)} ${
                     showAvatar ? "opacity-0" : "opacity-100"
                 }`}
             />
+            {playRemoteAudio && (
+                <audio ref={audioRef} autoPlay playsInline className="hidden" aria-hidden />
+            )}
             {waitingShare && (
                 <div className="absolute inset-0 flex items-center justify-center bg-black/80 px-2 text-center text-[11px] text-white/80">
                     Подключение экрана…
@@ -278,12 +338,14 @@ function ControlButton({
     label,
     disabled,
     danger,
+    active,
 }: {
     children: ReactNode;
     onClick: () => void;
     label: string;
     disabled?: boolean;
     danger?: boolean;
+    active?: boolean;
 }) {
     return (
         <button
@@ -295,7 +357,9 @@ function ControlButton({
             className={`inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-full p-0 leading-none transition disabled:opacity-40 sm:h-12 sm:w-12 [&_svg]:block [&_svg]:h-[18px] [&_svg]:w-[18px] ${
                 danger
                     ? "bg-tg-danger text-white hover:bg-tg-danger-hover"
-                    : "bg-tg-surface-2 text-tg-text hover:bg-tg-panel"
+                    : active
+                      ? "bg-tg-surface-2 text-tg-text ring-2 ring-tg-online hover:bg-tg-panel"
+                      : "bg-tg-surface-2 text-tg-text hover:bg-tg-panel"
             }`}
         >
             {children}
