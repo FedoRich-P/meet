@@ -1,0 +1,77 @@
+@import url("https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700&display=swap");
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Manrope", ui-sans-serif, system-ui, sans-serif;
+
+  --color-tg-bg: #0e1621;
+  --color-tg-surface: #17212b;
+  --color-tg-surface-2: #232e3c;
+  --color-tg-panel: #242f3d;
+  --color-tg-header: #17212b;
+  --color-tg-border: #0e1621;
+  --color-tg-text: #f5f5f5;
+  --color-tg-text-muted: #7d8b99;
+  --color-tg-accent: #2aabee;
+  --color-tg-accent-hover: #229ed9;
+  --color-tg-bubble-out: #2b5278;
+  --color-tg-bubble-in: #182533;
+  --color-tg-online: #0fce5d;
+  --color-tg-danger: #e53935;
+  --color-tg-danger-hover: #c62828;
+  --color-tg-success: #4fae4e;
+  --color-tg-success-hover: #45a044;
+  --color-tg-warning: #f0b132;
+  --color-tg-chat-pattern: #0b141a;
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    margin: 0;
+    font-family: var(--font-sans);
+    background-color: var(--color-tg-bg);
+    color: var(--color-tg-text);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  button,
+  input,
+  textarea {
+    font-family: inherit;
+  }
+
+  * {
+    box-sizing: border-box;
+  }
+}
+
+@layer utilities {
+  .tg-chat-bg {
+    background-color: var(--color-tg-chat-pattern);
+    background-image:
+      radial-gradient(ellipse at 20% 20%, rgb(42 171 238 / 0.06), transparent 45%),
+      radial-gradient(ellipse at 80% 80%, rgb(43 82 120 / 0.12), transparent 40%),
+      repeating-linear-gradient(
+        -12deg,
+        transparent,
+        transparent 11px,
+        rgb(255 255 255 / 0.015) 11px,
+        rgb(255 255 255 / 0.015) 12px
+      );
+  }
+
+  .tg-scrollbar::-webkit-scrollbar {
+    width: 6px;
+  }
+
+  .tg-scrollbar::-webkit-scrollbar-thumb {
+    background: rgb(125 139 153 / 0.35);
+    border-radius: 999px;
+  }
+}

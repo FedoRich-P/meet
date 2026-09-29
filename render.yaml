@@ -1,0 +1,16 @@
+# Render Blueprint: one URL for UI + Socket.IO + API (like Dion / Telemost link)
+# Dashboard: New → Blueprint → connect repo with this file
+services:
+  - type: web
+    name: meet
+    runtime: node
+    plan: free
+    buildCommand: npm ci --prefix client && npm run build --prefix client && npm ci --prefix server && npm run build --prefix server
+    startCommand: npm start --prefix server
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PUBLIC_ORIGIN
+        sync: false
+      - key: MONGODB_URI
+        sync: false

@@ -1,0 +1,8 @@
+{
+  "rewrites": [
+    {
+      "source": "/socket.io/(.*)",
+      "destination": "https://chat-websocket-3k7r.onrender.com"
+    }
+  ]
+}
