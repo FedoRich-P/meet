@@ -83,12 +83,17 @@ async function loadIceConfig(): Promise<RTCConfiguration> {
                     iceConfigPromise = null;
                     return FALLBACK_ICE;
                 }
-                return {
+                const cfg: RTCConfiguration = {
                     iceServers: data.iceServers,
-                    iceCandidatePoolSize: 4,
-                    bundlePolicy: "max-bundle" as RTCBundlePolicy,
-                    rtcpMuxPolicy: "require" as RTCRtcpMuxPolicy,
+                    iceCandidatePoolSize: 8,
+                    bundlePolicy: "max-bundle",
+                    rtcpMuxPolicy: "require",
                 };
+                // Cross-NAT calls: force TURN relay when available (host/srflx often fail)
+                if (iceHasTurn(cfg)) {
+                    cfg.iceTransportPolicy = "relay";
+                }
+                return cfg;
             })
             .catch(() => {
                 iceConfigPromise = null;
@@ -229,6 +234,8 @@ export function useMeetingRoom(
     const [localSpeaking, setLocalSpeaking] = useState(false);
     const iceConfigRef = useRef<RTCConfiguration>(FALLBACK_ICE);
     const earlyIceRef = useRef<Map<string, RTCIceCandidateInit[]>>(new Map());
+    const creatingPeersRef = useRef<Map<string, Promise<PeerStateType>>>(new Map());
+    const recoverAttemptsRef = useRef<Map<string, number>>(new Map());
     const analyseCtxRef = useRef<AudioContext | null>(null);
 
     useEffect(() => {
@@ -536,33 +543,20 @@ export function useMeetingRoom(
         remoteStreamsRef.current.delete(id);
         peerConnRef.current.delete(id);
         earlyIceRef.current.delete(id);
+        creatingPeersRef.current.delete(id);
         publishTiles();
     }
 
-    async function restartIceForPeer(remoteId: string, state: PeerStateType): Promise<void> {
+    async function offerToPeer(remoteId: string, state: PeerStateType, iceRestart = false): Promise<void> {
         const me = localUserIdRef.current;
         if (!me || me === "pending") return;
-        // Only the impolite peer starts ICE restart to avoid glare storms
-        if (state.polite) return;
-        if (state.restartingIce || state.makingOffer) return;
-        if (state.iceRestartCount >= 4) return;
+        if (state.makingOffer) return;
         if (state.pc.signalingState === "closed") return;
-
-        state.restartingIce = true;
-        state.iceRestartCount += 1;
         try {
-            await new Promise((resolve) => window.setTimeout(resolve, 400 * state.iceRestartCount));
-            if (state.pc.connectionState === "connected" || state.pc.iceConnectionState === "connected") {
-                return;
-            }
-            await ensureIceConfig();
-            try {
-                state.pc.setConfiguration(iceConfigRef.current);
-            } catch {
-                // setConfiguration may throw if PC is closed
-            }
             state.makingOffer = true;
-            const offer = await state.pc.createOffer({ iceRestart: true });
+            const offer = iceRestart
+                ? await state.pc.createOffer({ iceRestart: true })
+                : await state.pc.createOffer();
             await state.pc.setLocalDescription(offer);
             socket.emit("callUser", {
                 userToCall: remoteId,
@@ -571,9 +565,77 @@ export function useMeetingRoom(
                 name: localUserName,
             });
         } catch (err) {
-            console.error("[meet] ICE restart failed", err);
+            console.error("[meet] offerToPeer", err);
         } finally {
             state.makingOffer = false;
+        }
+    }
+
+    async function restartIceForPeer(remoteId: string, state: PeerStateType): Promise<void> {
+        const me = localUserIdRef.current;
+        if (!me || me === "pending") return;
+        if (peersRef.current.get(remoteId)?.pc !== state.pc) return;
+        if (state.restartingIce || state.makingOffer) return;
+        if (state.pc.signalingState === "closed") return;
+
+        // Polite peer: after prolonged fail, rebuild PC and wait for offer
+        if (state.polite) {
+            state.iceRestartCount += 1;
+            if (state.iceRestartCount <= 2) return;
+            state.restartingIce = true;
+            try {
+                const attempts = (recoverAttemptsRef.current.get(remoteId) ?? 0) + 1;
+                recoverAttemptsRef.current.set(remoteId, attempts);
+                if (attempts > 5) return;
+                closePeer(remoteId);
+                await createPeer(remoteId);
+            } finally {
+                state.restartingIce = false;
+            }
+            return;
+        }
+
+        state.restartingIce = true;
+        state.iceRestartCount += 1;
+        try {
+            await new Promise((resolve) => window.setTimeout(resolve, 500 * state.iceRestartCount));
+            if (
+                state.pc.connectionState === "connected" ||
+                state.pc.iceConnectionState === "connected" ||
+                state.pc.iceConnectionState === "completed"
+            ) {
+                return;
+            }
+
+            if (state.iceRestartCount > 2) {
+                const attempts = (recoverAttemptsRef.current.get(remoteId) ?? 0) + 1;
+                recoverAttemptsRef.current.set(remoteId, attempts);
+                if (attempts > 5) {
+                    console.warn("[meet] giving up ICE recover for", remoteId);
+                    return;
+                }
+                closePeer(remoteId);
+                if (attempts >= 2 && iceConfigRef.current.iceTransportPolicy === "relay") {
+                    iceConfigRef.current = {
+                        ...iceConfigRef.current,
+                        iceTransportPolicy: "all",
+                    };
+                }
+                const next = await createPeer(remoteId);
+                if (!next.polite) await offerToPeer(remoteId, next, false);
+                return;
+            }
+
+            await ensureIceConfig();
+            try {
+                state.pc.setConfiguration(iceConfigRef.current);
+            } catch {
+                // ignore
+            }
+            await offerToPeer(remoteId, state, true);
+        } catch (err) {
+            console.error("[meet] ICE restart failed", err);
+        } finally {
             state.restartingIce = false;
         }
     }
@@ -582,135 +644,153 @@ export function useMeetingRoom(
         const existing = peersRef.current.get(remoteId);
         if (existing) return existing;
 
-        await ensureIceConfig();
+        const inflight = creatingPeersRef.current.get(remoteId);
+        if (inflight) return inflight;
 
-        const localId = localUserIdRef.current;
-        const polite = localId > remoteId;
-        const pc = new RTCPeerConnection(iceConfigRef.current);
-        const state: PeerStateType = {
-            pc,
-            makingOffer: false,
-            ignoreOffer: false,
-            polite,
-            pendingIce: [],
-            iceRestartCount: 0,
-            restartingIce: false,
-        };
-        peersRef.current.set(remoteId, state);
+        const build = (async (): Promise<PeerStateType> => {
+            await ensureIceConfig();
 
-        const early = earlyIceRef.current.get(remoteId);
-        if (early?.length) {
-            state.pendingIce.push(...early);
-            earlyIceRef.current.delete(remoteId);
-        }
+            const again = peersRef.current.get(remoteId);
+            if (again) return again;
 
-        const audioTx = pc.addTransceiver("audio", { direction: "sendrecv" });
-        const videoTx = pc.addTransceiver("video", { direction: "sendrecv" });
+            const localId = localUserIdRef.current;
+            const polite = localId > remoteId;
+            const pc = new RTCPeerConnection(iceConfigRef.current);
+            const state: PeerStateType = {
+                pc,
+                makingOffer: false,
+                ignoreOffer: false,
+                polite,
+                pendingIce: [],
+                iceRestartCount: 0,
+                restartingIce: false,
+            };
+            peersRef.current.set(remoteId, state);
 
-        const local = localStreamRef.current;
-        if (local) {
-            const audioTrack = local.getAudioTracks()[0];
-            const videoTrack = local.getVideoTracks()[0];
-            if (audioTrack) void audioTx.sender.replaceTrack(audioTrack);
-            if (videoTrack) void videoTx.sender.replaceTrack(videoTrack);
-        }
-
-        pc.onicecandidate = (event) => {
-            if (event.candidate) {
-                socket.emit("iceCandidate", { to: remoteId, candidate: event.candidate });
+            const early = earlyIceRef.current.get(remoteId);
+            if (early?.length) {
+                state.pendingIce.push(...early);
+                earlyIceRef.current.delete(remoteId);
             }
-        };
 
-        pc.oniceconnectionstatechange = () => {
-            const iceState = pc.iceConnectionState;
-            if (iceState === "failed" || iceState === "disconnected") {
-                peerConnRef.current.set(
-                    remoteId,
-                    iceState === "failed" ? "failed" : pc.connectionState || iceState
-                );
-                publishTiles();
-            }
-            if (iceState === "failed") {
-                void restartIceForPeer(remoteId, state);
-            }
-            if (iceState === "connected" || iceState === "completed") {
-                state.iceRestartCount = 0;
-            }
-        };
+            const audioTx = pc.addTransceiver("audio", { direction: "sendrecv" });
+            const videoTx = pc.addTransceiver("video", { direction: "sendrecv" });
 
-        pc.ontrack = (event) => {
-            let stream = remoteStreamsRef.current.get(remoteId);
-            if (!stream) {
-                stream = new MediaStream();
-                remoteStreamsRef.current.set(remoteId, stream);
+            const local = localStreamRef.current;
+            if (local) {
+                const audioTrack = local.getAudioTracks()[0];
+                const videoTrack = local.getVideoTracks()[0];
+                if (audioTrack) void audioTx.sender.replaceTrack(audioTrack);
+                if (videoTrack) void videoTx.sender.replaceTrack(videoTrack);
             }
-            const incoming = event.track;
-            if (incoming) {
-                if (incoming.kind === "video") {
-                    for (const existingTrack of stream.getVideoTracks()) {
-                        if (existingTrack.id !== incoming.id) stream.removeTrack(existingTrack);
-                    }
-                }
-                if (incoming.kind === "audio") {
-                    for (const existingTrack of stream.getAudioTracks()) {
-                        if (existingTrack.id !== incoming.id) stream.removeTrack(existingTrack);
-                    }
-                }
-                if (!stream.getTrackById(incoming.id)) stream.addTrack(incoming);
-                incoming.enabled = true;
-                incoming.onunmute = () => publishTiles();
-                incoming.onmute = () => publishTiles();
-                incoming.onended = () => {
-                    if (stream.getTrackById(incoming.id)) stream.removeTrack(incoming);
+
+            pc.onicecandidate = (event) => {
+                if (!event.candidate) return;
+                const payload =
+                    typeof event.candidate.toJSON === "function"
+                        ? event.candidate.toJSON()
+                        : event.candidate;
+                socket.emit("iceCandidate", { to: remoteId, candidate: payload });
+            };
+
+            pc.onicegatheringstatechange = () => {
+                if (pc.iceGatheringState === "complete") {
                     publishTiles();
-                };
-                if (
-                    incoming.kind === "video" &&
-                    (peerSharingRef.current.has(remoteId) || trackLooksLikeScreen(incoming))
-                ) {
-                    setStagePeerId(remoteId);
                 }
-            }
-            publishTiles();
-            window.dispatchEvent(new CustomEvent("meet-unlock-audio"));
-        };
+            };
 
-        pc.onconnectionstatechange = () => {
-            peerConnRef.current.set(remoteId, pc.connectionState);
-            publishTiles();
-            if (pc.connectionState === "connected") {
-                state.iceRestartCount = 0;
+            pc.oniceconnectionstatechange = () => {
+                const iceState = pc.iceConnectionState;
+                if (iceState === "failed") {
+                    peerConnRef.current.set(remoteId, "failed");
+                    publishTiles();
+                    void restartIceForPeer(remoteId, state);
+                } else if (iceState === "disconnected") {
+                    peerConnRef.current.set(remoteId, "disconnected");
+                    publishTiles();
+                    window.setTimeout(() => {
+                        if (pc.iceConnectionState === "disconnected" || pc.iceConnectionState === "failed") {
+                            void restartIceForPeer(remoteId, state);
+                        }
+                    }, 2500);
+                } else if (iceState === "connected" || iceState === "completed") {
+                    state.iceRestartCount = 0;
+                    recoverAttemptsRef.current.delete(remoteId);
+                    peerConnRef.current.set(remoteId, "connected");
+                    publishTiles();
+                }
+            };
+
+            pc.ontrack = (event) => {
+                let stream = remoteStreamsRef.current.get(remoteId);
+                if (!stream) {
+                    stream = new MediaStream();
+                    remoteStreamsRef.current.set(remoteId, stream);
+                }
+                const incoming = event.track;
+                if (incoming) {
+                    if (incoming.kind === "video") {
+                        for (const existingTrack of stream.getVideoTracks()) {
+                            if (existingTrack.id !== incoming.id) stream.removeTrack(existingTrack);
+                        }
+                    }
+                    if (incoming.kind === "audio") {
+                        for (const existingTrack of stream.getAudioTracks()) {
+                            if (existingTrack.id !== incoming.id) stream.removeTrack(existingTrack);
+                        }
+                    }
+                    if (!stream.getTrackById(incoming.id)) stream.addTrack(incoming);
+                    incoming.enabled = true;
+                    incoming.onunmute = () => publishTiles();
+                    incoming.onmute = () => publishTiles();
+                    incoming.onended = () => {
+                        if (stream.getTrackById(incoming.id)) stream.removeTrack(incoming);
+                        publishTiles();
+                    };
+                    if (
+                        incoming.kind === "video" &&
+                        (peerSharingRef.current.has(remoteId) || trackLooksLikeScreen(incoming))
+                    ) {
+                        setStagePeerId(remoteId);
+                    }
+                }
+                publishTiles();
                 window.dispatchEvent(new CustomEvent("meet-unlock-audio"));
-            }
-            if (pc.connectionState === "failed") {
-                void restartIceForPeer(remoteId, state);
-            }
-            if (pc.connectionState === "closed") {
-                closePeer(remoteId);
-            }
-        };
+            };
 
-        pc.onnegotiationneeded = async () => {
-            const me = localUserIdRef.current;
-            if (!me || me === "pending") return;
-            if (state.makingOffer || pc.signalingState !== "stable") return;
-            try {
-                state.makingOffer = true;
-                await pc.setLocalDescription();
-                socket.emit("callUser", {
-                    userToCall: remoteId,
-                    signal: pc.localDescription,
-                    from: me,
-                    name: localUserName,
-                });
-            } catch (err) {
-                console.error("negotiationneeded", err);
-            } finally {
-                state.makingOffer = false;
-            }
-        };
+            pc.onconnectionstatechange = () => {
+                peerConnRef.current.set(remoteId, pc.connectionState);
+                publishTiles();
+                if (pc.connectionState === "connected") {
+                    state.iceRestartCount = 0;
+                    window.dispatchEvent(new CustomEvent("meet-unlock-audio"));
+                }
+                if (pc.connectionState === "failed") {
+                    void restartIceForPeer(remoteId, state);
+                }
+                if (pc.connectionState === "closed") {
+                    closePeer(remoteId);
+                }
+            };
 
-        return state;
+            pc.onnegotiationneeded = async () => {
+                const me = localUserIdRef.current;
+                if (!me || me === "pending") return;
+                if (state.makingOffer || pc.signalingState !== "stable") return;
+                // Impolite peer drives negotiation
+                if (state.polite) return;
+                await offerToPeer(remoteId, state, false);
+            };
+
+            return state;
+        })();
+
+        creatingPeersRef.current.set(remoteId, build);
+        try {
+            return await build;
+        } finally {
+            creatingPeersRef.current.delete(remoteId);
+        }
     }
 
     async function handleRemoteSignal(
@@ -772,20 +852,7 @@ export function useMeetingRoom(
             if (localId < id && state.pc.signalingState === "stable") {
                 const senders = state.pc.getSenders();
                 if (senders.length > 0 && !state.pc.remoteDescription) {
-                    try {
-                        state.makingOffer = true;
-                        await state.pc.setLocalDescription();
-                        socket.emit("callUser", {
-                            userToCall: id,
-                            signal: state.pc.localDescription,
-                            from: localId,
-                            name: localUserName,
-                        });
-                    } catch (err) {
-                        console.error("manual offer", err);
-                    } finally {
-                        state.makingOffer = false;
-                    }
+                    await offerToPeer(id, state, false);
                 }
             }
         }

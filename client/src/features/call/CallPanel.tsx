@@ -191,7 +191,7 @@ export function CallPanel({
                     </div>
                 )}
 
-                {needsAudioTap && remoteTiles.length > 0 && (
+                {needsAudioTap && remoteTiles.length > 0 && stageTile?.connection === "на связи" && (
                     <button
                         type="button"
                         onClick={(e) => {

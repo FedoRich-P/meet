@@ -316,20 +316,42 @@ app.get("/api/ice", async (_req: Request, res: Response) => {
 
     const preferred = process.env.METERED_DOMAIN?.trim().replace(/\.metered\.live$/i, "");
     const domains = [...new Set([preferred, "meet-uedq", "meet"].filter(Boolean))] as string[];
+    const regions = ["global", "europe_west", ""];
 
     try {
+        const merged: IceServerType[] = [...fallback];
+        const seen = new Set<string>();
+        const keyOf = (s: IceServerType): string => {
+            const urls = Array.isArray(s.urls) ? s.urls.join(",") : String(s.urls);
+            return `${urls}|${s.username ?? ""}|${s.credential ?? ""}`;
+        };
+
         for (const domain of domains) {
-            const url = `https://${domain}.metered.live/api/v1/turn/credentials?apiKey=${encodeURIComponent(meteredKey)}`;
-            const response = await fetch(url);
-            if (!response.ok) {
-                console.warn("Metered TURN credentials failed", domain, response.status);
-                continue;
+            let gotAny = false;
+            for (const region of regions) {
+                const qs = new URLSearchParams({ apiKey: meteredKey });
+                if (region) qs.set("region", region);
+                const url = `https://${domain}.metered.live/api/v1/turn/credentials?${qs.toString()}`;
+                const response = await fetch(url);
+                if (!response.ok) {
+                    console.warn("Metered TURN credentials failed", domain, region || "default", response.status);
+                    continue;
+                }
+                const data = (await response.json()) as IceServerType[] | { iceServers?: IceServerType[] };
+                const iceServers = Array.isArray(data) ? data : data.iceServers;
+                if (!iceServers?.length) continue;
+                gotAny = true;
+                for (const server of iceServers) {
+                    const k = keyOf(server);
+                    if (seen.has(k)) continue;
+                    seen.add(k);
+                    merged.push(server);
+                }
             }
-            const data = (await response.json()) as IceServerType[] | { iceServers?: IceServerType[] };
-            const iceServers = Array.isArray(data) ? data : data.iceServers;
-            if (!iceServers?.length) continue;
-            console.log("Metered TURN ok via", domain);
-            return res.json({ iceServers: [...fallback, ...iceServers] });
+            if (gotAny) {
+                console.log("Metered TURN ok via", domain, "servers:", merged.length);
+                return res.json({ iceServers: merged });
+            }
         }
         console.warn("Metered TURN: all domains failed", domains.join(", "));
         return res.json({ iceServers: fallback });
