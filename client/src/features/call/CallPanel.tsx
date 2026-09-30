@@ -77,16 +77,6 @@ export function CallPanel({
         return () => window.removeEventListener("meet-audio-blocked", onNeedTap);
     }, []);
 
-    // Yandex Browser often blocks unmuted autoplay until an explicit click
-    useEffect(() => {
-        const ya = /YaBrowser|Yandex/i.test(navigator.userAgent);
-        if (!ya) return;
-        const hasRemote = remoteTiles.some(
-            (t) => t.connection === "на связи" || t.audioEnabled || Boolean(t.stream)
-        );
-        if (hasRemote) setNeedsAudioTap(true);
-    }, [remoteTiles]);
-
     function unlockRemoteAudio() {
         setNeedsAudioTap(false);
         window.dispatchEvent(new CustomEvent("meet-unlock-audio"));
@@ -115,6 +105,17 @@ export function CallPanel({
     }, [needsAudioTap]);
 
     const remoteTiles = tiles.filter((t) => !t.isLocal);
+
+    // Yandex Browser often blocks unmuted autoplay until an explicit click
+    useEffect(() => {
+        const ya = /YaBrowser|Yandex/i.test(navigator.userAgent);
+        if (!ya) return;
+        const hasRemote = remoteTiles.some(
+            (t) => t.connection === "на связи" || t.audioEnabled || Boolean(t.stream)
+        );
+        if (hasRemote) setNeedsAudioTap(true);
+    }, [remoteTiles]);
+
     const stageTile =
         tiles.find((t) => t.id === stagePeerId) ??
         tiles.find((t) => t.isSharing) ??
