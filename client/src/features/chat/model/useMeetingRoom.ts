@@ -645,7 +645,34 @@ export function useMeetingRoom(
         }
     }
 
-    async function createPeer(remoteId: string): Promise<PeerStateType> {
+    function attachLocalMedia(pc: RTCPeerConnection): void {
+        const local = localStreamRef.current;
+        const audioTrack = local?.getAudioTracks()[0];
+        const videoTrack = local?.getVideoTracks()[0];
+
+        const audioSender =
+            pc.getSenders().find((s) => s.track?.kind === "audio") ??
+            pc.getTransceivers().find((t) => t.receiver.track.kind === "audio")?.sender;
+        const videoSenderExisting =
+            pc.getSenders().find((s) => s.track?.kind === "video") ??
+            pc.getTransceivers().find((t) => t.receiver.track.kind === "video")?.sender;
+
+        if (audioTrack) {
+            if (audioSender) void audioSender.replaceTrack(audioTrack);
+            else pc.addTrack(audioTrack, local!);
+        } else if (!pc.getTransceivers().some((t) => t.receiver.track.kind === "audio")) {
+            pc.addTransceiver("audio", { direction: "recvonly" });
+        }
+
+        if (videoTrack) {
+            if (videoSenderExisting) void videoSenderExisting.replaceTrack(videoTrack);
+            else pc.addTrack(videoTrack, local!);
+        } else if (!pc.getTransceivers().some((t) => t.receiver.track.kind === "video")) {
+            pc.addTransceiver("video", { direction: "recvonly" });
+        }
+    }
+
+    async function createPeer(remoteId: string, options?: { asAnswerer?: boolean }): Promise<PeerStateType> {
         const existing = peersRef.current.get(remoteId);
         if (existing) return existing;
 
@@ -678,15 +705,10 @@ export function useMeetingRoom(
                 earlyIceRef.current.delete(remoteId);
             }
 
-            const audioTx = pc.addTransceiver("audio", { direction: "sendrecv" });
-            const videoTx = pc.addTransceiver("video", { direction: "sendrecv" });
-
-            const local = localStreamRef.current;
-            if (local) {
-                const audioTrack = local.getAudioTracks()[0];
-                const videoTrack = local.getVideoTracks()[0];
-                if (audioTrack) void audioTx.sender.replaceTrack(audioTrack);
-                if (videoTrack) void videoTx.sender.replaceTrack(videoTrack);
+            // Offer side: attach media before createOffer.
+            // Answer side: wait until after setRemoteDescription (attach in handleRemoteSignal).
+            if (!options?.asAnswerer) {
+                attachLocalMedia(pc);
             }
 
             pc.onicecandidate = (event) => {
@@ -769,17 +791,7 @@ export function useMeetingRoom(
                 if (pc.connectionState === "connected") {
                     state.iceRestartCount = 0;
                     recoverAttemptsRef.current.delete(remoteId);
-                    const local = localStreamRef.current;
-                    if (local) {
-                        for (const track of local.getTracks()) {
-                            const target =
-                                pc.getSenders().find((s) => s.track?.kind === track.kind) ??
-                                pc.getTransceivers().find((t) => t.receiver.track.kind === track.kind)?.sender;
-                            if (target && target.track?.id !== track.id) {
-                                void target.replaceTrack(track);
-                            }
-                        }
-                    }
+                    attachLocalMedia(pc);
                     window.dispatchEvent(new CustomEvent("meet-unlock-audio"));
                     const remote = remoteStreamsRef.current.get(remoteId);
                     const hasRemoteAudio = Boolean(remote?.getAudioTracks().length);
@@ -799,7 +811,6 @@ export function useMeetingRoom(
                 const me = localUserIdRef.current;
                 if (!me || me === "pending") return;
                 if (state.makingOffer || pc.signalingState !== "stable") return;
-                // Impolite peer drives negotiation
                 if (state.polite) return;
                 await offerToPeer(remoteId, state, false);
             };
@@ -822,7 +833,8 @@ export function useMeetingRoom(
     ): Promise<void> {
         if (name) peerNamesRef.current.set(from, name);
         await ensureLocalStream();
-        const state = await createPeer(from);
+        const asAnswerer = signal.type === "offer";
+        const state = await createPeer(from, { asAnswerer });
         const { pc, polite } = state;
 
         const offerCollision =
@@ -840,6 +852,7 @@ export function useMeetingRoom(
         await pc.setRemoteDescription(signal);
         await flushPendingIce(state);
         if (signal.type === "offer") {
+            attachLocalMedia(pc);
             await pc.setLocalDescription();
             socket.emit("answerCall", { to: from, signal: pc.localDescription });
         }
