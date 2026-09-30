@@ -509,7 +509,8 @@ export function useMeetingRoom(
         setHasLocalMedia(true);
         setMediaError(null);
 
-        for (const { pc } of peersRef.current.values()) {
+        for (const [remoteId, state] of peersRef.current.entries()) {
+            const { pc } = state;
             for (const track of stream.getTracks()) {
                 const sender =
                     pc.getSenders().find((s) => s.track?.kind === track.kind) ??
@@ -519,6 +520,10 @@ export function useMeetingRoom(
                 } else {
                     pc.addTrack(track, stream);
                 }
+            }
+            // Renegotiate so the remote actually gets ontrack for late-attached media
+            if (!state.polite && pc.signalingState === "stable" && pc.remoteDescription) {
+                void offerToPeer(remoteId, state, false);
             }
         }
 
@@ -763,7 +768,24 @@ export function useMeetingRoom(
                 publishTiles();
                 if (pc.connectionState === "connected") {
                     state.iceRestartCount = 0;
+                    recoverAttemptsRef.current.delete(remoteId);
+                    const local = localStreamRef.current;
+                    if (local) {
+                        for (const track of local.getTracks()) {
+                            const target =
+                                pc.getSenders().find((s) => s.track?.kind === track.kind) ??
+                                pc.getTransceivers().find((t) => t.receiver.track.kind === track.kind)?.sender;
+                            if (target && target.track?.id !== track.id) {
+                                void target.replaceTrack(track);
+                            }
+                        }
+                    }
                     window.dispatchEvent(new CustomEvent("meet-unlock-audio"));
+                    const remote = remoteStreamsRef.current.get(remoteId);
+                    const hasRemoteAudio = Boolean(remote?.getAudioTracks().length);
+                    if (!hasRemoteAudio && !state.polite && pc.signalingState === "stable") {
+                        void offerToPeer(remoteId, state, false);
+                    }
                 }
                 if (pc.connectionState === "failed") {
                     void restartIceForPeer(remoteId, state);
@@ -947,12 +969,18 @@ export function useMeetingRoom(
                 pendingIce: state.pendingIce.length,
                 remoteAudio: remoteStreamsRef.current.get(id)?.getAudioTracks().length ?? 0,
                 remoteVideo: remoteStreamsRef.current.get(id)?.getVideoTracks().length ?? 0,
+                localSendAudio: state.pc.getSenders().some((s) => s.track?.kind === "audio" && s.track.readyState === "live"),
             }));
             return {
                 localUserId: localUserIdRef.current,
                 iceHasTurn: iceHasTurn(iceConfigRef.current),
                 icePolicy: iceConfigRef.current.iceTransportPolicy ?? "all",
                 muted: isMutedRef.current,
+                localAudio: localStreamRef.current?.getAudioTracks().map((t) => ({
+                    id: t.id,
+                    enabled: t.enabled,
+                    readyState: t.readyState,
+                })),
                 peers,
                 hint: connectionHint,
             };
@@ -964,11 +992,15 @@ export function useMeetingRoom(
             }
         };
         window.addEventListener("keydown", onKey);
+        const syncTimer = window.setInterval(() => {
+            if (peersRef.current.size > 0) publishTiles();
+        }, 1500);
         return () => {
+            window.clearInterval(syncTimer);
             window.removeEventListener("keydown", onKey);
             delete (window as unknown as { __meetDebug?: () => unknown }).__meetDebug;
         };
-    }, [connectionHint]);
+    }, [connectionHint, publishTiles]);
 
     useEffect(() => {
         return () => {
