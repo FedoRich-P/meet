@@ -1,25 +1,34 @@
 import { type FormEvent, useEffect, useRef, useState } from "react";
 import { useDispatch, useSelector } from "react-redux";
-import { useNavigate, useParams } from "react-router";
+import { useLocation, useNavigate, useParams } from "react-router";
 import { clearMessages, setRoom, setUser } from "../../entities";
 import { userNameSelector } from "../../entities/user/userSlice.ts";
 import { PATH } from "../../app/paths";
 import { useSocket } from "../../shared";
 import type { RootState } from "../../app/store.ts";
+import { parseUsersPayload } from "../../shared/lib/usersPayload.ts";
 import { MeetingShell } from "../../widgets/MeetingShell/MeetingShell.tsx";
+
+export type MeetingLocationStateType = {
+    autoJoin?: boolean;
+};
 
 export function Meeting() {
     const { meetingId = "" } = useParams<{ meetingId: string }>();
     const navigate = useNavigate();
+    const location = useLocation();
     const socket = useSocket();
     const dispatch = useDispatch();
     const storedName = useSelector(userNameSelector);
     const room = useSelector((state: RootState) => state.user.room);
 
-    /** Prefill only — do not auto-join until user submits the gate form */
+    const locationState = location.state as MeetingLocationStateType | null;
+
+    /** Prefill only — do not auto-join until user submits the gate form (unless creator autoJoin) */
     const [nameInput, setNameInput] = useState(() => localStorage.getItem("user") ?? "");
     const [gatePassed, setGatePassed] = useState(false);
     const [roomReady, setRoomReady] = useState(false);
+    const [endedHint, setEndedHint] = useState<string | null>(null);
     const joinedRef = useRef(false);
 
     useEffect(() => {
@@ -27,18 +36,26 @@ export function Meeting() {
             navigate(PATH.HOME, { replace: true });
             return;
         }
-        try {
-            if (sessionStorage.getItem(`meet_ended:${meetingId}`)) {
-                navigate(PATH.HOME, { replace: true });
-                return;
-            }
-        } catch {
-            // ignore
-        }
+
         dispatch(setRoom(meetingId));
         joinedRef.current = false;
-        setGatePassed(false);
         setRoomReady(false);
+
+        try {
+            if (sessionStorage.getItem(`meet_ended:${meetingId}`)) {
+                sessionStorage.removeItem(`meet_ended:${meetingId}`);
+                setEndedHint("Эта встреча раньше завершалась. Можно войти снова по той же ссылке.");
+            } else {
+                setEndedHint(null);
+            }
+        } catch {
+            setEndedHint(null);
+        }
+
+        const shouldAutoJoin = Boolean(locationState?.autoJoin) && Boolean(storedName);
+        setGatePassed(shouldAutoJoin);
+        // Only re-run when meeting id changes — not when location.state is cleared after join
+        // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [meetingId, dispatch, navigate]);
 
     useEffect(() => {
@@ -51,8 +68,9 @@ export function Meeting() {
             if (joinedRoom !== meetingId) return;
             setRoomReady(true);
         };
-        const onUsers = () => {
-            // Fallback if older server build without joinedRoom
+        const onUsers = (payload: unknown) => {
+            const parsed = parseUsersPayload(payload as Parameters<typeof parseUsersPayload>[0]);
+            if (parsed.room && parsed.room !== meetingId) return;
             setRoomReady(true);
         };
 
@@ -64,6 +82,8 @@ export function Meeting() {
                 socket.emit("getUsers", meetingId);
                 return;
             }
+            // Drop any previous socket room membership before joining
+            socket.emit("leaveChat");
             const title = localStorage.getItem(`meet_title:${meetingId}`) || undefined;
             socket.emit("newUser", { name: storedName, room: meetingId, title, isOrganizer });
             joinedRef.current = true;
@@ -87,7 +107,6 @@ export function Meeting() {
         };
         socket.on("connect", onReconnect);
 
-        // Safety timeout so UI is not stuck forever
         const readyTimer = window.setTimeout(() => setRoomReady(true), 4000);
 
         return () => {
@@ -108,9 +127,11 @@ export function Meeting() {
             } catch {
                 // ignore
             }
+            socket.emit("leaveChat");
             dispatch(clearMessages());
             joinedRef.current = false;
             setGatePassed(false);
+            setRoomReady(false);
             navigate(PATH.HOME, { replace: true });
         };
         socket.on("meetingEnded", onEnded);
@@ -124,9 +145,15 @@ export function Meeting() {
         const name = nameInput.trim();
         if (!name || !meetingId) return;
 
+        try {
+            sessionStorage.removeItem(`meet_ended:${meetingId}`);
+        } catch {
+            // ignore
+        }
         localStorage.setItem("user", name);
         dispatch(setUser(name));
         dispatch(setRoom(meetingId));
+        setEndedHint(null);
         setRoomReady(false);
         setGatePassed(true);
     }
@@ -151,6 +178,14 @@ export function Meeting() {
                 >
                     <h1 className="text-xl font-semibold text-tg-text">Встреча</h1>
                     <p className="mt-1 text-sm text-tg-text-muted">Как вас показать участникам?</p>
+                    <p className="mt-2 break-all rounded-lg bg-tg-bg px-3 py-2 font-mono text-[11px] text-tg-text-muted">
+                        код: {meetingId}
+                    </p>
+                    {endedHint && (
+                        <p className="mt-3 rounded-lg bg-tg-warning/15 px-3 py-2 text-xs text-tg-warning" role="status">
+                            {endedHint}
+                        </p>
+                    )}
                     {!socket.connected && (
                         <p className="mt-3 text-xs text-tg-warning">Подключение к серверу…</p>
                     )}
@@ -184,7 +219,7 @@ export function Meeting() {
         return (
             <div className="flex min-h-full flex-col items-center justify-center gap-2 bg-tg-bg px-4 text-tg-text">
                 <p className="text-sm font-medium">Вход во встречу…</p>
-                <p className="text-xs text-tg-text-muted">Ждём подтверждение сервера</p>
+                <p className="text-xs text-tg-text-muted">код: {meetingId}</p>
             </div>
         );
     }

@@ -258,9 +258,9 @@ export function MeetingShell({ meetingId, onLeave }: MeetingShellProps) {
         try {
             await navigator.clipboard.writeText(shareUrl);
             setCopied(true);
-            setTimeout(() => setCopied(false), 2000);
+            setTimeout(() => setCopied(false), 2500);
         } catch {
-            // ignore
+            window.prompt("Скопируйте ссылку на встречу:", shareUrl);
         }
     }
 
@@ -314,6 +314,9 @@ export function MeetingShell({ meetingId, onLeave }: MeetingShellProps) {
                             <span className="ml-1.5 font-normal text-tg-text-muted">{subtitle}</span>
                         ) : null}
                     </h1>
+                    <p className="truncate font-mono text-[10px] text-tg-text-muted" title={shareUrl}>
+                        {meetingId}
+                    </p>
                 </div>
 
                 <button

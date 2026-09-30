@@ -40,7 +40,7 @@ export function Home() {
         if (asOrganizer) {
             localStorage.setItem(`meet_org:${meetingId}`, name);
         }
-        navigate(PATH.meeting(meetingId));
+        navigate(PATH.meeting(meetingId), { state: { autoJoin: true } });
     }
 
     function handleCreate(e: FormEvent<HTMLFormElement>) {

@@ -210,7 +210,7 @@ function clearAloneTimer(room: string): void {
     aloneTimers.delete(room);
 }
 
-const ALONE_IDLE_MS = 5 * 60_000;
+const ALONE_IDLE_MS = 30 * 60_000;
 const ALONE_WARN_MS = 60_000;
 
 function scheduleAloneEnd(room: string): void {
@@ -374,7 +374,7 @@ app.get("/api/messages", async (req: Request, res: Response) => {
 
 io.on("connection", (socket: Socket) => {
     function emitUsers(room: string) {
-        io.to(room).emit("users", listRoster(room));
+        io.to(room).emit("users", { room, users: listRoster(room) });
         scheduleAloneEnd(room);
     }
 
@@ -431,6 +431,14 @@ io.on("connection", (socket: Socket) => {
             isOrganizer?: boolean;
         }) => {
             try {
+                // Always leave previous room before joining a new one (prevents dual-room ghost sync)
+                const previous = users.get(socket.id);
+                if (previous && previous.room !== room) {
+                    markMemberLeft(socket.id);
+                    socket.leave(previous.room);
+                    emitUsers(previous.room);
+                }
+
                 upsertMember(socket.id, name, room);
                 socket.join(room);
 
@@ -463,10 +471,9 @@ io.on("connection", (socket: Socket) => {
                     organizerSocketId: meta.organizerSocketId,
                 });
 
-                // Joiner must get roster even if room broadcast races with client listeners
                 const roster = listRoster(room);
-                socket.emit("users", roster);
-                io.to(room).emit("users", roster);
+                socket.emit("users", { room, users: roster });
+                io.to(room).emit("users", { room, users: roster });
                 socket.emit("joinedRoom", { room, selfId: socket.id, users: roster });
 
                 for (const id of sharingSockets) {
@@ -599,7 +606,7 @@ io.on("connection", (socket: Socket) => {
     });
 
     socket.on("getUsers", (room: string) => {
-        socket.emit("users", listRoster(room));
+        socket.emit("users", { room, users: listRoster(room) });
     });
 
     socket.on("callUser", ({ userToCall, signal, from, name }) => {

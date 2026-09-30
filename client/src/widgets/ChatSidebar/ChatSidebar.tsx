@@ -3,6 +3,7 @@ import { useSelector } from "react-redux";
 import { useSocket } from "../../shared";
 import type { RootState } from "../../app/store.ts";
 import type { User } from "../../shared/types.ts";
+import { parseUsersPayload } from "../../shared/lib/usersPayload.ts";
 
 /** @deprecated Prefer ParticipantsPanel — kept for legacy imports */
 export function ChatSidebar() {
@@ -11,7 +12,11 @@ export function ChatSidebar() {
     const { room } = useSelector((state: RootState) => state.user);
 
     useEffect(() => {
-        const handleUsers = (next: User[]) => setUsers(next);
+        const handleUsers = (payload: unknown) => {
+            const parsed = parseUsersPayload(payload as Parameters<typeof parseUsersPayload>[0]);
+            if (parsed.room && room && parsed.room !== room) return;
+            setUsers(parsed.users);
+        };
         socket.on("users", handleUsers);
         if (room) socket.emit("getUsers", room);
         return () => {

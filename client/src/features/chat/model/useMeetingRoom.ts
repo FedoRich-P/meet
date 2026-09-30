@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useSocket } from "../../../shared";
+import { parseUsersPayload } from "../../../shared/lib/usersPayload.ts";
 
 export type PeerTileType = {
     id: string;
@@ -970,7 +971,11 @@ export function useMeetingRoom(
             await queueRemoteIceCandidate(from, candidate);
         };
 
-        const onUsers = (users: RoomUserType[]) => {
+        const onUsers = (payload: unknown) => {
+            const { room: eventRoom, users } = parseUsersPayload(
+                payload as Parameters<typeof parseUsersPayload>[0]
+            );
+            if (eventRoom && eventRoom !== roomId) return;
             void syncPeers(users.filter((u) => u.online !== false && !u.leftAt));
         };
 
