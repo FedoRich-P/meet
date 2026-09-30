@@ -313,17 +313,26 @@ app.get("/api/ice", async (_req: Request, res: Response) => {
     if (!meteredKey) {
         return res.json({ iceServers: fallback });
     }
+
+    const preferred = process.env.METERED_DOMAIN?.trim().replace(/\.metered\.live$/i, "");
+    const domains = [...new Set([preferred, "meet-uedq", "meet"].filter(Boolean))] as string[];
+
     try {
-        const url = `https://meet.metered.live/api/v1/turn/credentials?apiKey=${encodeURIComponent(meteredKey)}`;
-        const response = await fetch(url);
-        if (!response.ok) {
-            console.warn("Metered TURN credentials failed", response.status);
-            return res.json({ iceServers: fallback });
+        for (const domain of domains) {
+            const url = `https://${domain}.metered.live/api/v1/turn/credentials?apiKey=${encodeURIComponent(meteredKey)}`;
+            const response = await fetch(url);
+            if (!response.ok) {
+                console.warn("Metered TURN credentials failed", domain, response.status);
+                continue;
+            }
+            const data = (await response.json()) as IceServerType[] | { iceServers?: IceServerType[] };
+            const iceServers = Array.isArray(data) ? data : data.iceServers;
+            if (!iceServers?.length) continue;
+            console.log("Metered TURN ok via", domain);
+            return res.json({ iceServers: [...fallback, ...iceServers] });
         }
-        const data = (await response.json()) as IceServerType[] | { iceServers?: IceServerType[] };
-        const iceServers = Array.isArray(data) ? data : data.iceServers;
-        if (!iceServers?.length) return res.json({ iceServers: fallback });
-        return res.json({ iceServers: [...fallback, ...iceServers] });
+        console.warn("Metered TURN: all domains failed", domains.join(", "));
+        return res.json({ iceServers: fallback });
     } catch (err) {
         console.warn("Metered TURN fetch error", err);
         return res.json({ iceServers: fallback });

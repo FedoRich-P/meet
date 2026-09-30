@@ -52,6 +52,9 @@ const FALLBACK_ICE: RTCConfiguration = {
         { urls: "stun:stun1.l.google.com:19302" },
         { urls: "stun:stun.cloudflare.com:3478" },
     ],
+    iceCandidatePoolSize: 4,
+    bundlePolicy: "max-bundle",
+    rtcpMuxPolicy: "require",
 };
 
 let iceConfigPromise: Promise<RTCConfiguration> | null = null;
@@ -60,18 +63,43 @@ const analyserHolders = new WeakMap<
     { source: MediaStreamAudioSourceNode; analyser: AnalyserNode; trackId: string }
 >();
 
+function iceHasTurn(cfg: RTCConfiguration): boolean {
+    return (cfg.iceServers ?? []).some((server) => {
+        const urls = Array.isArray(server.urls) ? server.urls : [server.urls];
+        return urls.some((url) => typeof url === "string" && url.startsWith("turn"));
+    });
+}
+
 async function loadIceConfig(): Promise<RTCConfiguration> {
     if (!iceConfigPromise) {
         iceConfigPromise = fetch("/api/ice")
             .then(async (res) => {
-                if (!res.ok) return FALLBACK_ICE;
+                if (!res.ok) {
+                    iceConfigPromise = null;
+                    return FALLBACK_ICE;
+                }
                 const data = (await res.json()) as { iceServers?: RTCIceServer[] };
-                if (!data.iceServers?.length) return FALLBACK_ICE;
-                return { iceServers: data.iceServers };
+                if (!data.iceServers?.length) {
+                    iceConfigPromise = null;
+                    return FALLBACK_ICE;
+                }
+                return {
+                    iceServers: data.iceServers,
+                    iceCandidatePoolSize: 4,
+                    bundlePolicy: "max-bundle" as RTCBundlePolicy,
+                    rtcpMuxPolicy: "require" as RTCRtcpMuxPolicy,
+                };
             })
-            .catch(() => FALLBACK_ICE);
+            .catch(() => {
+                iceConfigPromise = null;
+                return FALLBACK_ICE;
+            });
     }
     return iceConfigPromise;
+}
+
+function hasRemoteDescription(pc: RTCPeerConnection): boolean {
+    return Boolean(pc.remoteDescription);
 }
 
 function connectionLabel(state: string): string {
@@ -161,6 +189,9 @@ type PeerStateType = {
     makingOffer: boolean;
     ignoreOffer: boolean;
     polite: boolean;
+    pendingIce: RTCIceCandidateInit[];
+    iceRestartCount: number;
+    restartingIce: boolean;
 };
 
 export function useMeetingRoom(
@@ -197,6 +228,7 @@ export function useMeetingRoom(
     const [speakingIds, setSpeakingIds] = useState<Set<string>>(() => new Set());
     const [localSpeaking, setLocalSpeaking] = useState(false);
     const iceConfigRef = useRef<RTCConfiguration>(FALLBACK_ICE);
+    const earlyIceRef = useRef<Map<string, RTCIceCandidateInit[]>>(new Map());
     const analyseCtxRef = useRef<AudioContext | null>(null);
 
     useEffect(() => {
@@ -206,8 +238,51 @@ export function useMeetingRoom(
     useEffect(() => {
         void loadIceConfig().then((cfg) => {
             iceConfigRef.current = cfg;
+            if (!iceHasTurn(cfg)) {
+                console.warn("[meet] /api/ice returned no TURN — cross-network calls may fail");
+            }
         });
     }, []);
+
+    async function ensureIceConfig(): Promise<RTCConfiguration> {
+        const cfg = await loadIceConfig();
+        iceConfigRef.current = cfg;
+        return cfg;
+    }
+
+    async function flushPendingIce(state: PeerStateType): Promise<void> {
+        if (!hasRemoteDescription(state.pc) || state.pendingIce.length === 0) return;
+        const queued = state.pendingIce.splice(0, state.pendingIce.length);
+        for (const candidate of queued) {
+            try {
+                await state.pc.addIceCandidate(candidate);
+            } catch (err) {
+                console.warn("[meet] addIceCandidate (flush)", err);
+            }
+        }
+    }
+
+    async function queueRemoteIceCandidate(
+        remoteId: string,
+        candidate: RTCIceCandidateInit
+    ): Promise<void> {
+        const state = peersRef.current.get(remoteId);
+        if (!state) {
+            const early = earlyIceRef.current.get(remoteId) ?? [];
+            early.push(candidate);
+            earlyIceRef.current.set(remoteId, early);
+            return;
+        }
+        if (!hasRemoteDescription(state.pc)) {
+            state.pendingIce.push(candidate);
+            return;
+        }
+        try {
+            await state.pc.addIceCandidate(candidate);
+        } catch (err) {
+            console.warn("[meet] addIceCandidate", err);
+        }
+    }
 
     useEffect(() => {
         let stopped = false;
@@ -460,18 +535,74 @@ export function useMeetingRoom(
         peersRef.current.delete(id);
         remoteStreamsRef.current.delete(id);
         peerConnRef.current.delete(id);
+        earlyIceRef.current.delete(id);
         publishTiles();
     }
 
-    function createPeer(remoteId: string): PeerStateType {
+    async function restartIceForPeer(remoteId: string, state: PeerStateType): Promise<void> {
+        const me = localUserIdRef.current;
+        if (!me || me === "pending") return;
+        // Only the impolite peer starts ICE restart to avoid glare storms
+        if (state.polite) return;
+        if (state.restartingIce || state.makingOffer) return;
+        if (state.iceRestartCount >= 4) return;
+        if (state.pc.signalingState === "closed") return;
+
+        state.restartingIce = true;
+        state.iceRestartCount += 1;
+        try {
+            await new Promise((resolve) => window.setTimeout(resolve, 400 * state.iceRestartCount));
+            if (state.pc.connectionState === "connected" || state.pc.iceConnectionState === "connected") {
+                return;
+            }
+            await ensureIceConfig();
+            try {
+                state.pc.setConfiguration(iceConfigRef.current);
+            } catch {
+                // setConfiguration may throw if PC is closed
+            }
+            state.makingOffer = true;
+            const offer = await state.pc.createOffer({ iceRestart: true });
+            await state.pc.setLocalDescription(offer);
+            socket.emit("callUser", {
+                userToCall: remoteId,
+                signal: state.pc.localDescription,
+                from: me,
+                name: localUserName,
+            });
+        } catch (err) {
+            console.error("[meet] ICE restart failed", err);
+        } finally {
+            state.makingOffer = false;
+            state.restartingIce = false;
+        }
+    }
+
+    async function createPeer(remoteId: string): Promise<PeerStateType> {
         const existing = peersRef.current.get(remoteId);
         if (existing) return existing;
+
+        await ensureIceConfig();
 
         const localId = localUserIdRef.current;
         const polite = localId > remoteId;
         const pc = new RTCPeerConnection(iceConfigRef.current);
-        const state: PeerStateType = { pc, makingOffer: false, ignoreOffer: false, polite };
+        const state: PeerStateType = {
+            pc,
+            makingOffer: false,
+            ignoreOffer: false,
+            polite,
+            pendingIce: [],
+            iceRestartCount: 0,
+            restartingIce: false,
+        };
         peersRef.current.set(remoteId, state);
+
+        const early = earlyIceRef.current.get(remoteId);
+        if (early?.length) {
+            state.pendingIce.push(...early);
+            earlyIceRef.current.delete(remoteId);
+        }
 
         const audioTx = pc.addTransceiver("audio", { direction: "sendrecv" });
         const videoTx = pc.addTransceiver("video", { direction: "sendrecv" });
@@ -487,6 +618,23 @@ export function useMeetingRoom(
         pc.onicecandidate = (event) => {
             if (event.candidate) {
                 socket.emit("iceCandidate", { to: remoteId, candidate: event.candidate });
+            }
+        };
+
+        pc.oniceconnectionstatechange = () => {
+            const iceState = pc.iceConnectionState;
+            if (iceState === "failed" || iceState === "disconnected") {
+                peerConnRef.current.set(
+                    remoteId,
+                    iceState === "failed" ? "failed" : pc.connectionState || iceState
+                );
+                publishTiles();
+            }
+            if (iceState === "failed") {
+                void restartIceForPeer(remoteId, state);
+            }
+            if (iceState === "connected" || iceState === "completed") {
+                state.iceRestartCount = 0;
             }
         };
 
@@ -530,9 +678,12 @@ export function useMeetingRoom(
         pc.onconnectionstatechange = () => {
             peerConnRef.current.set(remoteId, pc.connectionState);
             publishTiles();
+            if (pc.connectionState === "connected") {
+                state.iceRestartCount = 0;
+                window.dispatchEvent(new CustomEvent("meet-unlock-audio"));
+            }
             if (pc.connectionState === "failed") {
-                // restart ICE
-                void pc.restartIce?.();
+                void restartIceForPeer(remoteId, state);
             }
             if (pc.connectionState === "closed") {
                 closePeer(remoteId);
@@ -569,7 +720,7 @@ export function useMeetingRoom(
     ): Promise<void> {
         if (name) peerNamesRef.current.set(from, name);
         await ensureLocalStream();
-        const state = createPeer(from);
+        const state = await createPeer(from);
         const { pc, polite } = state;
 
         const offerCollision =
@@ -585,6 +736,7 @@ export function useMeetingRoom(
         }
 
         await pc.setRemoteDescription(signal);
+        await flushPendingIce(state);
         if (signal.type === "offer") {
             await pc.setLocalDescription();
             socket.emit("answerCall", { to: from, signal: pc.localDescription });
@@ -595,6 +747,8 @@ export function useMeetingRoom(
     async function syncPeers(users: RoomUserType[]): Promise<void> {
         const localId = localUserIdRef.current;
         if (!localId || localId === "pending") return;
+
+        await ensureIceConfig();
 
         try {
             await ensureLocalStream();
@@ -613,12 +767,9 @@ export function useMeetingRoom(
         }
 
         for (const id of remoteIds) {
-            createPeer(id);
-            // Impolite peer (smaller id) kicks negotiation by ensuring tracks are attached;
-            // onnegotiationneeded will fire after addTrack.
-            // If tracks already added before listener, manually offer:
-            const state = peersRef.current.get(id);
-            if (state && localId < id && state.pc.signalingState === "stable") {
+            const state = await createPeer(id);
+            // Impolite peer (smaller id) kicks negotiation
+            if (localId < id && state.pc.signalingState === "stable") {
                 const senders = state.pc.getSenders();
                 if (senders.length > 0 && !state.pc.remoteDescription) {
                     try {
@@ -669,15 +820,8 @@ export function useMeetingRoom(
         };
 
         const onIce = async ({ from, candidate }: { from: string; candidate: RTCIceCandidateInit }) => {
-            const state = peersRef.current.get(from);
-            if (!state || !candidate) return;
-            try {
-                await state.pc.addIceCandidate(candidate);
-            } catch {
-                if (!state.ignoreOffer) {
-                    // ignore
-                }
-            }
+            if (!candidate) return;
+            await queueRemoteIceCandidate(from, candidate);
         };
 
         const onUsers = (users: RoomUserType[]) => {
