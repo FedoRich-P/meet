@@ -658,8 +658,8 @@ export function useMeetingRoom(
 
     function attachLocalMedia(pc: RTCPeerConnection): void {
         const local = localStreamRef.current;
-        const audioTrack = local?.getAudioTracks()[0];
-        const videoTrack = local?.getVideoTracks()[0];
+        const audioTrack = local?.getAudioTracks().find((t) => t.readyState === "live");
+        const videoTrack = local?.getVideoTracks().find((t) => t.readyState === "live" && t.enabled);
 
         const audioSender =
             pc.getSenders().find((s) => s.track?.kind === "audio") ??
@@ -672,15 +672,52 @@ export function useMeetingRoom(
             if (audioSender) void audioSender.replaceTrack(audioTrack);
             else pc.addTrack(audioTrack, local!);
         } else if (!pc.getTransceivers().some((t) => t.receiver.track.kind === "audio")) {
-            pc.addTransceiver("audio", { direction: "recvonly" });
+            // sendrecv so mic can be attached later without a dead recvonly m-line
+            pc.addTransceiver("audio", { direction: "sendrecv" });
         }
 
         if (videoTrack) {
             if (videoSenderExisting) void videoSenderExisting.replaceTrack(videoTrack);
             else pc.addTrack(videoTrack, local!);
         } else if (!pc.getTransceivers().some((t) => t.receiver.track.kind === "video")) {
-            pc.addTransceiver("video", { direction: "recvonly" });
+            // sendrecv so camera/screen replaceTrack actually sends to remotes
+            pc.addTransceiver("video", { direction: "sendrecv" });
         }
+    }
+
+    async function publishVideoToPeers(
+        track: MediaStreamTrack | null,
+        mode: "camera" | "screen"
+    ): Promise<void> {
+        const local = localStreamRef.current;
+        for (const [remoteId, state] of peersRef.current.entries()) {
+            const { pc } = state;
+            const sender = videoSender(pc);
+            const transceiver =
+                pc.getTransceivers().find((t) => t.sender === sender) ??
+                pc.getTransceivers().find((t) => t.receiver.track.kind === "video");
+
+            let needsRenegotiate = false;
+            if (track && transceiver) {
+                if (transceiver.direction === "recvonly" || transceiver.direction === "inactive") {
+                    transceiver.direction = "sendrecv";
+                    needsRenegotiate = true;
+                }
+            }
+
+            if (sender) {
+                await sender.replaceTrack(track);
+                if (track) await applyVideoSenderEncoding(sender, mode);
+            } else if (track && local) {
+                pc.addTrack(track, local);
+                needsRenegotiate = true;
+            }
+
+            if (needsRenegotiate && pc.signalingState === "stable" && !state.makingOffer) {
+                void offerToPeer(remoteId, state, false);
+            }
+        }
+        publishTiles();
     }
 
     async function createPeer(remoteId: string, options?: { asAnswerer?: boolean }): Promise<PeerStateType> {
@@ -822,7 +859,7 @@ export function useMeetingRoom(
                 const me = localUserIdRef.current;
                 if (!me || me === "pending") return;
                 if (state.makingOffer || pc.signalingState !== "stable") return;
-                if (state.polite) return;
+                // Perfect negotiation: either side may offer; glare handled in handleRemoteSignal
                 await offerToPeer(remoteId, state, false);
             };
 
@@ -1168,13 +1205,6 @@ export function useMeetingRoom(
                 if (!stream.getVideoTracks().includes(videoTrack)) {
                     stream.addTrack(videoTrack);
                 }
-                for (const { pc } of peersRef.current.values()) {
-                    const sender = videoSender(pc);
-                    if (sender) {
-                        await sender.replaceTrack(videoTrack);
-                        await applyVideoSenderEncoding(sender, "camera");
-                    } else pc.addTrack(videoTrack, stream);
-                }
                 setHasLocalMedia(true);
             }
 
@@ -1188,22 +1218,13 @@ export function useMeetingRoom(
                 videoTrack.stop();
                 if (stream.getVideoTracks().includes(videoTrack)) stream.removeTrack(videoTrack);
                 if (cameraTrackRef.current === videoTrack) cameraTrackRef.current = null;
-                for (const { pc } of peersRef.current.values()) {
-                    const sender = videoSender(pc);
-                    if (sender) await sender.replaceTrack(null);
-                }
+                await publishVideoToPeers(null, "camera");
                 camWasOffRef.current = true;
                 setIsCamOff(true);
             } else {
                 videoTrack.enabled = true;
                 if (!stream.getVideoTracks().includes(videoTrack)) stream.addTrack(videoTrack);
-                for (const { pc } of peersRef.current.values()) {
-                    const sender = videoSender(pc);
-                    if (sender) {
-                        await sender.replaceTrack(videoTrack);
-                        await applyVideoSenderEncoding(sender, "camera");
-                    } else pc.addTrack(videoTrack, stream);
-                }
+                await publishVideoToPeers(videoTrack, "camera");
                 camWasOffRef.current = false;
                 setIsCamOff(false);
             }
@@ -1235,13 +1256,7 @@ export function useMeetingRoom(
                 cam.stop();
                 cameraTrackRef.current = null;
             }
-            for (const { pc } of peersRef.current.values()) {
-                const sender = videoSender(pc);
-                if (sender) {
-                    await sender.replaceTrack(turnCamOn && cam ? cam : null);
-                    if (turnCamOn && cam) await applyVideoSenderEncoding(sender, "camera");
-                }
-            }
+            await publishVideoToPeers(turnCamOn && cam ? cam : null, "camera");
         }
         isSharingRef.current = false;
         setIsSharing(false);
@@ -1291,15 +1306,7 @@ export function useMeetingRoom(
             }
             if (!local.getVideoTracks().includes(screenTrack)) local.addTrack(screenTrack);
 
-            for (const { pc } of peersRef.current.values()) {
-                const sender = videoSender(pc);
-                if (sender) {
-                    await sender.replaceTrack(screenTrack);
-                    await applyVideoSenderEncoding(sender, "screen");
-                } else {
-                    pc.addTrack(screenTrack, local);
-                }
-            }
+            await publishVideoToPeers(screenTrack, "screen");
 
             isSharingRef.current = true;
             setIsSharing(true);

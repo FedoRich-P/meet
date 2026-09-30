@@ -360,22 +360,18 @@ function RemoteAudio({
                 setSinkId?: (id: string) => Promise<void>;
             };
             if (!el.setSinkId) return;
+            // "communications" often breaks desktop output (sound drops). Use default speakers.
             try {
-                await el.setSinkId(speakerphone ? "default" : "communications");
+                await el.setSinkId("default");
             } catch {
-                try {
-                    await el.setSinkId("default");
-                } catch {
-                    // browser may ignore sink selection
-                }
+                // browser may ignore sink selection
             }
         };
 
         const play = () => {
-            audio.srcObject = stream;
+            if (audio.srcObject !== stream) audio.srcObject = stream;
             audio.muted = soundOff;
-            // Slightly below 1.0 reduces feedback/echo with speakers
-            audio.volume = soundOff ? 0 : speakerphone ? 1 : 0.85;
+            audio.volume = soundOff ? 0 : 1;
             void applySink();
             void audio.play().catch(() => onBlocked());
         };
@@ -383,11 +379,16 @@ function RemoteAudio({
         play();
         const onUnlock = () => play();
         const onSpeaker = () => play();
+        const keepAlive = window.setInterval(() => {
+            if (soundOff) return;
+            if (audio.paused) void audio.play().catch(() => onBlocked());
+        }, 2000);
         stream.addEventListener("addtrack", play);
         stream.addEventListener("removetrack", play);
         window.addEventListener("meet-unlock-audio", onUnlock);
         window.addEventListener("meet-speakerphone", onSpeaker);
         return () => {
+            window.clearInterval(keepAlive);
             stream.removeEventListener("addtrack", play);
             stream.removeEventListener("removetrack", play);
             window.removeEventListener("meet-unlock-audio", onUnlock);
