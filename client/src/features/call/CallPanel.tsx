@@ -77,10 +77,42 @@ export function CallPanel({
         return () => window.removeEventListener("meet-audio-blocked", onNeedTap);
     }, []);
 
+    // Yandex Browser often blocks unmuted autoplay until an explicit click
+    useEffect(() => {
+        const ya = /YaBrowser|Yandex/i.test(navigator.userAgent);
+        if (!ya) return;
+        const hasRemote = remoteTiles.some(
+            (t) => t.connection === "на связи" || t.audioEnabled || Boolean(t.stream)
+        );
+        if (hasRemote) setNeedsAudioTap(true);
+    }, [remoteTiles]);
+
     function unlockRemoteAudio() {
         setNeedsAudioTap(false);
         window.dispatchEvent(new CustomEvent("meet-unlock-audio"));
+        try {
+            const AC =
+                window.AudioContext ||
+                (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+            if (AC) {
+                const ctx = new AC();
+                void ctx.resume();
+            }
+        } catch {
+            // ignore
+        }
     }
+
+    useEffect(() => {
+        if (!needsAudioTap) return;
+        const unlock = () => unlockRemoteAudio();
+        window.addEventListener("pointerdown", unlock, { once: true });
+        window.addEventListener("keydown", unlock, { once: true });
+        return () => {
+            window.removeEventListener("pointerdown", unlock);
+            window.removeEventListener("keydown", unlock);
+        };
+    }, [needsAudioTap]);
 
     const remoteTiles = tiles.filter((t) => !t.isLocal);
     const stageTile =
@@ -212,16 +244,19 @@ export function CallPanel({
                     </div>
                 )}
 
-                {needsAudioTap && remoteTiles.length > 0 && stageTile?.connection === "на связи" && (
+                {needsAudioTap && remoteTiles.length > 0 && (
                     <button
                         type="button"
                         onClick={(e) => {
                             e.stopPropagation();
                             unlockRemoteAudio();
                         }}
-                        className="absolute left-1/2 top-1/2 z-30 max-w-[85%] -translate-x-1/2 -translate-y-1/2 rounded-xl bg-black/85 px-4 py-3 text-center text-sm text-white ring-2 ring-tg-online"
+                        className="absolute left-1/2 top-1/2 z-30 max-w-[90%] -translate-x-1/2 -translate-y-1/2 rounded-xl bg-black/90 px-5 py-4 text-center text-sm font-medium text-white shadow-lg ring-2 ring-tg-online"
                     >
-                        Нажмите, чтобы включить звук собеседника
+                        Нажмите, чтобы включить звук
+                        <span className="mt-1 block text-xs font-normal text-white/70">
+                            Яндекс и некоторые браузеры блокируют звук без клика
+                        </span>
                     </button>
                 )}
             </div>
@@ -324,10 +359,10 @@ function RemoteAudioLayer({
     onBlocked: () => void;
 }) {
     return (
-        <div className="pointer-events-none absolute h-0 w-0 overflow-hidden" aria-hidden>
+        <div className="pointer-events-none fixed bottom-0 left-0 z-0 h-px w-px overflow-hidden opacity-0" aria-hidden>
             {remotes.map((tile) => (
                 <RemoteAudio
-                    key={`${tile.id}-${tile.audioTrackId}`}
+                    key={`${tile.id}-${tile.audioTrackId || "a"}`}
                     stream={tile.stream}
                     soundOff={soundOff}
                     speakerphone={speakerphone}
@@ -360,11 +395,10 @@ function RemoteAudio({
                 setSinkId?: (id: string) => Promise<void>;
             };
             if (!el.setSinkId) return;
-            // "communications" often breaks desktop output (sound drops). Use default speakers.
             try {
                 await el.setSinkId("default");
             } catch {
-                // browser may ignore sink selection
+                // ignore
             }
         };
 
@@ -373,16 +407,35 @@ function RemoteAudio({
             audio.muted = soundOff;
             audio.volume = soundOff ? 0 : 1;
             void applySink();
-            void audio.play().catch(() => onBlocked());
+            const result = audio.play();
+            if (result && typeof result.then === "function") {
+                void result.catch(() => onBlocked());
+            }
         };
 
+        // Yandex/Chrome: unmuted autoplay often blocked until gesture
         play();
+        if (!soundOff) {
+            try {
+                const nav = navigator as Navigator & {
+                    getAutoplayPolicy?: (type: string) => string;
+                };
+                if (nav.getAutoplayPolicy && nav.getAutoplayPolicy("mediaelement") === "allowed-muted") {
+                    onBlocked();
+                }
+            } catch {
+                // ignore
+            }
+        }
+
         const onUnlock = () => play();
         const onSpeaker = () => play();
         const keepAlive = window.setInterval(() => {
             if (soundOff) return;
-            if (audio.paused) void audio.play().catch(() => onBlocked());
-        }, 2000);
+            if (audio.paused) {
+                void audio.play().catch(() => onBlocked());
+            }
+        }, 1500);
         stream.addEventListener("addtrack", play);
         stream.addEventListener("removetrack", play);
         window.addEventListener("meet-unlock-audio", onUnlock);
@@ -396,7 +449,7 @@ function RemoteAudio({
         };
     }, [stream, soundOff, speakerphone, onBlocked]);
 
-    return <audio ref={audioRef} autoPlay playsInline />;
+    return <audio ref={audioRef} autoPlay playsInline preload="auto" />;
 }
 
 function videoFitClass(tile: PeerTileType, variant: "stage" | "thumb"): string {
