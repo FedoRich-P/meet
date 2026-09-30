@@ -88,11 +88,10 @@ async function loadIceConfig(): Promise<RTCConfiguration> {
                     iceCandidatePoolSize: 8,
                     bundlePolicy: "max-bundle",
                     rtcpMuxPolicy: "require",
+                    // Prefer "all": host/srflx for LAN/Wi‑Fi, TURN relay still in iceServers for hard NATs.
+                    // Forcing "relay" hung forever on some mobile networks ("соединение…").
+                    iceTransportPolicy: "all",
                 };
-                // Cross-NAT calls: force TURN relay when available (host/srflx often fail)
-                if (iceHasTurn(cfg)) {
-                    cfg.iceTransportPolicy = "relay";
-                }
                 return cfg;
             })
             .catch(() => {
@@ -236,6 +235,7 @@ export function useMeetingRoom(
     const earlyIceRef = useRef<Map<string, RTCIceCandidateInit[]>>(new Map());
     const creatingPeersRef = useRef<Map<string, Promise<PeerStateType>>>(new Map());
     const recoverAttemptsRef = useRef<Map<string, number>>(new Map());
+    const peerMissRef = useRef<Map<string, number>>(new Map());
     const analyseCtxRef = useRef<AudioContext | null>(null);
 
     useEffect(() => {
@@ -314,6 +314,15 @@ export function useMeetingRoom(
 
         const onRemoteSpeaking = ({ from, speaking }: { from: string; speaking: boolean }) => {
             remoteSpeaking.set(from, speaking);
+            // Peer visible via socket speaking but missing from WebRTC map → refresh roster
+            if (
+                speaking &&
+                from &&
+                from !== localUserIdRef.current &&
+                !peersRef.current.has(from)
+            ) {
+                socket.emit("getUsers", roomId);
+            }
         };
         socket.on("speaking", onRemoteSpeaking);
 
@@ -502,9 +511,10 @@ export function useMeetingRoom(
         });
 
         localStreamRef.current = stream;
-        for (const track of stream.getAudioTracks()) track.enabled = false;
-        isMutedRef.current = true;
-        setIsMuted(true);
+        // Start with mic on so cross-network tests aren't "silent while connected"
+        for (const track of stream.getAudioTracks()) track.enabled = true;
+        isMutedRef.current = false;
+        setIsMuted(false);
         setIsCamOff(true);
         setHasLocalMedia(true);
         setMediaError(null);
@@ -815,6 +825,17 @@ export function useMeetingRoom(
                 await offerToPeer(remoteId, state, false);
             };
 
+            // If ICE hangs on "connecting" (common on cellular), recover
+            window.setTimeout(() => {
+                if (peersRef.current.get(remoteId)?.pc !== pc) return;
+                const cs = pc.connectionState;
+                const ice = pc.iceConnectionState;
+                if (cs === "connected" || ice === "connected" || ice === "completed") return;
+                if (cs === "closed" || cs === "failed") return;
+                console.warn("[meet] ICE still not connected after 8s", remoteId, cs, ice);
+                void restartIceForPeer(remoteId, state);
+            }, 8000);
+
             return state;
         })();
 
@@ -878,7 +899,17 @@ export function useMeetingRoom(
         const remoteIds = new Set(users.map((u) => u.id).filter((id) => id !== localId));
 
         for (const id of [...peersRef.current.keys()]) {
-            if (!remoteIds.has(id)) closePeer(id);
+            if (!remoteIds.has(id)) {
+                // Stale/partial roster must not wipe live peers (caused remotes:[])
+                const misses = (peerMissRef.current.get(id) ?? 0) + 1;
+                peerMissRef.current.set(id, misses);
+                if (misses >= 3) {
+                    peerMissRef.current.delete(id);
+                    closePeer(id);
+                }
+            } else {
+                peerMissRef.current.delete(id);
+            }
         }
 
         for (const id of remoteIds) {
@@ -890,6 +921,19 @@ export function useMeetingRoom(
                     await offerToPeer(id, state, false);
                 }
             }
+            // If stuck without remote SDP, retry offer shortly
+            window.setTimeout(() => {
+                const cur = peersRef.current.get(id);
+                if (!cur || cur.pc !== state.pc) return;
+                if (cur.pc.remoteDescription) return;
+                if (cur.polite) {
+                    socket.emit("getUsers", roomId);
+                    return;
+                }
+                if (cur.pc.signalingState === "stable") {
+                    void offerToPeer(id, cur, false);
+                }
+            }, 2000);
         }
         publishTiles();
     }
@@ -957,10 +1001,20 @@ export function useMeetingRoom(
         socket.emit("getUsers", roomId);
         const retryA = window.setTimeout(() => socket.emit("getUsers", roomId), 800);
         const retryB = window.setTimeout(() => socket.emit("getUsers", roomId), 2500);
+        const rosterPoll = window.setInterval(() => {
+            const alone = peersRef.current.size === 0;
+            const stuck = [...peersRef.current.values()].some(
+                (s) =>
+                    s.pc.connectionState !== "connected" &&
+                    s.pc.connectionState !== "closed"
+            );
+            if (alone || stuck) socket.emit("getUsers", roomId);
+        }, 4000);
 
         return () => {
             window.clearTimeout(retryA);
             window.clearTimeout(retryB);
+            window.clearInterval(rosterPoll);
             socket.off("incomingCall", onIncoming);
             socket.off("callAccepted", onAccepted);
             socket.off("iceCandidate", onIce);
