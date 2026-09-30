@@ -920,8 +920,12 @@ export function useMeetingRoom(
 
         // pull current roster now that we have a real socket id
         socket.emit("getUsers", roomId);
+        const retryA = window.setTimeout(() => socket.emit("getUsers", roomId), 800);
+        const retryB = window.setTimeout(() => socket.emit("getUsers", roomId), 2500);
 
         return () => {
+            window.clearTimeout(retryA);
+            window.clearTimeout(retryB);
             socket.off("incomingCall", onIncoming);
             socket.off("callAccepted", onAccepted);
             socket.off("iceCandidate", onIce);
@@ -930,6 +934,41 @@ export function useMeetingRoom(
         };
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [socket, localUserId, localUserName, roomId]);
+
+    useEffect(() => {
+        const dump = () => {
+            const peers = [...peersRef.current.entries()].map(([id, state]) => ({
+                id,
+                name: peerNamesRef.current.get(id),
+                connection: state.pc.connectionState,
+                ice: state.pc.iceConnectionState,
+                signaling: state.pc.signalingState,
+                polite: state.polite,
+                pendingIce: state.pendingIce.length,
+                remoteAudio: remoteStreamsRef.current.get(id)?.getAudioTracks().length ?? 0,
+                remoteVideo: remoteStreamsRef.current.get(id)?.getVideoTracks().length ?? 0,
+            }));
+            return {
+                localUserId: localUserIdRef.current,
+                iceHasTurn: iceHasTurn(iceConfigRef.current),
+                icePolicy: iceConfigRef.current.iceTransportPolicy ?? "all",
+                muted: isMutedRef.current,
+                peers,
+                hint: connectionHint,
+            };
+        };
+        (window as unknown as { __meetDebug?: () => unknown }).__meetDebug = dump;
+        const onKey = (e: KeyboardEvent) => {
+            if (e.ctrlKey && e.shiftKey && e.key.toLowerCase() === "m") {
+                console.info("[meet debug]", dump());
+            }
+        };
+        window.addEventListener("keydown", onKey);
+        return () => {
+            window.removeEventListener("keydown", onKey);
+            delete (window as unknown as { __meetDebug?: () => unknown }).__meetDebug;
+        };
+    }, [connectionHint]);
 
     useEffect(() => {
         return () => {

@@ -463,7 +463,12 @@ io.on("connection", (socket: Socket) => {
                     organizerSocketId: meta.organizerSocketId,
                 });
 
-                emitUsers(room);
+                // Joiner must get roster even if room broadcast races with client listeners
+                const roster = listRoster(room);
+                socket.emit("users", roster);
+                io.to(room).emit("users", roster);
+                socket.emit("joinedRoom", { room, selfId: socket.id, users: roster });
+
                 for (const id of sharingSockets) {
                     const sharer = users.get(id);
                     if (sharer?.room === room && id !== socket.id) {

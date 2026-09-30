@@ -19,6 +19,7 @@ export function Meeting() {
     /** Prefill only — do not auto-join until user submits the gate form */
     const [nameInput, setNameInput] = useState(() => localStorage.getItem("user") ?? "");
     const [gatePassed, setGatePassed] = useState(false);
+    const [roomReady, setRoomReady] = useState(false);
     const joinedRef = useRef(false);
 
     useEffect(() => {
@@ -37,6 +38,7 @@ export function Meeting() {
         dispatch(setRoom(meetingId));
         joinedRef.current = false;
         setGatePassed(false);
+        setRoomReady(false);
     }, [meetingId, dispatch, navigate]);
 
     useEffect(() => {
@@ -45,8 +47,23 @@ export function Meeting() {
 
         const isOrganizer = localStorage.getItem(`meet_org:${meetingId}`) === storedName;
 
+        const onJoined = ({ room: joinedRoom }: { room: string }) => {
+            if (joinedRoom !== meetingId) return;
+            setRoomReady(true);
+        };
+        const onUsers = () => {
+            // Fallback if older server build without joinedRoom
+            setRoomReady(true);
+        };
+
+        socket.on("joinedRoom", onJoined);
+        socket.on("users", onUsers);
+
         const join = () => {
-            if (joinedRef.current) return;
+            if (joinedRef.current) {
+                socket.emit("getUsers", meetingId);
+                return;
+            }
             const title = localStorage.getItem(`meet_title:${meetingId}`) || undefined;
             socket.emit("newUser", { name: storedName, room: meetingId, title, isOrganizer });
             joinedRef.current = true;
@@ -70,9 +87,15 @@ export function Meeting() {
         };
         socket.on("connect", onReconnect);
 
+        // Safety timeout so UI is not stuck forever
+        const readyTimer = window.setTimeout(() => setRoomReady(true), 4000);
+
         return () => {
+            window.clearTimeout(readyTimer);
             socket.off("connect", join);
             socket.off("connect", onReconnect);
+            socket.off("joinedRoom", onJoined);
+            socket.off("users", onUsers);
         };
     }, [gatePassed, meetingId, storedName, room, socket]);
 
@@ -104,6 +127,7 @@ export function Meeting() {
         localStorage.setItem("user", name);
         dispatch(setUser(name));
         dispatch(setRoom(meetingId));
+        setRoomReady(false);
         setGatePassed(true);
     }
 
@@ -111,6 +135,7 @@ export function Meeting() {
         socket.emit("leaveChat");
         dispatch(clearMessages());
         joinedRef.current = false;
+        setRoomReady(false);
         setGatePassed(false);
         navigate(PATH.HOME, { replace: true });
     }
@@ -151,6 +176,15 @@ export function Meeting() {
                         На главную
                     </button>
                 </form>
+            </div>
+        );
+    }
+
+    if (!roomReady) {
+        return (
+            <div className="flex min-h-full flex-col items-center justify-center gap-2 bg-tg-bg px-4 text-tg-text">
+                <p className="text-sm font-medium">Вход во встречу…</p>
+                <p className="text-xs text-tg-text-muted">Ждём подтверждение сервера</p>
             </div>
         );
     }

@@ -147,6 +147,27 @@ export function CallPanel({
             <div className="absolute left-3 top-3 z-20 max-w-[40%] rounded-lg bg-black/60 px-2 py-1 text-[11px] text-white/90">
                 {connectionHint}
             </div>
+            {import.meta.env.DEV ||
+            (typeof window !== "undefined" &&
+                new URLSearchParams(window.location.search).has("debug")) ? (
+                <pre className="pointer-events-none absolute bottom-24 left-3 z-30 max-h-40 max-w-[90%] overflow-auto rounded bg-black/80 p-2 text-[10px] leading-tight text-lime-300">
+                    {JSON.stringify(
+                        {
+                            hint: connectionHint,
+                            remotes: remoteTiles.map((t) => ({
+                                id: t.id.slice(0, 6),
+                                name: t.name,
+                                conn: t.connection,
+                                a: t.audioEnabled,
+                                v: t.videoEnabled,
+                            })),
+                            muted: isMuted,
+                        },
+                        null,
+                        0
+                    )}
+                </pre>
+            ) : null}
 
             <div
                 className="absolute inset-0"
